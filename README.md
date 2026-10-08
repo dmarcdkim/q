@@ -212,3 +212,15 @@ the `SSLKEYLOGFILE` environment variable is set to a file path.
 | QUIC toggle PMTU discovery    | ✅ |   ❌   |  ❌  |  ❌   |  ❌  |   ❌   |
 | QUIC timeouts (dial and idle) | ✅ |   ❌   |  ❌  |  ❌   |  ❌  |   ❌   |
 | TLS handshake timeout         | ✅ |   ❌   |  ❌  |  ❌   |  ❌  |   ❌   |
+
+## Daemon mode
+
+`q daemon [addr]` keeps one process resident and answers the same lookups over HTTP, so a caller that would otherwise fork `q` per query makes a local request instead. `addr` is a loopback `host:port` (default `127.0.0.1:8053`) or a filesystem path for a Unix socket.
+
+```bash
+q daemon
+curl 'http://127.0.0.1:8053/query?name=example.com&type=TXT&type=MX&server=9.9.9.9&timeout=3s'
+curl http://127.0.0.1:8053/health
+```
+
+`/query` returns what `q @9.9.9.9 TXT MX example.com --timeout=3s --format=json` prints; `type` and `server` repeat or take comma-separated lists. A failed lookup is a `502` whose body is the CLI error message.

@@ -2,12 +2,19 @@ package main
 
 import (
 	"bytes"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/net/idna"
 
@@ -16,9 +23,9 @@ import (
 )
 
 func run(args ...string) (*bytes.Buffer, error) {
-	clearOpts()
+	opts := newOpts()
 	var out bytes.Buffer
-	err := driver(append([]string{"+nocolor"}, args...), &out)
+	err := driver(&opts, append([]string{"+nocolor"}, args...), &out)
 	return &out, err
 }
 
@@ -239,6 +246,7 @@ func TestMainChaosClass(t *testing.T) {
 }
 
 func TestMainParsePlusFlags(t *testing.T) {
+	opts := newOpts()
 	cli.ParsePlusFlags(&opts, []string{"+dnssec", "+nord"})
 	assert.True(t, opts.DNSSEC)
 	assert.False(t, opts.RecursionDesired)
@@ -696,4 +704,70 @@ func TestMainMultipleServersAllFail(t *testing.T) {
 	timedOut := strings.Contains(err.Error(), "timeout after 2s")
 	erroredOut := strings.Contains(err.Error(), "all servers failed")
 	assert.True(t, timedOut || erroredOut)
+}
+
+func TestDaemonQuery(t *testing.T) {
+	srv := httptest.NewServer(daemonMux())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/query?name=example.com&type=A&server=9.9.9.9&timeout=5s")
+	assert.Nil(t, err)
+	body, _ := io.ReadAll(res.Body)
+	assert.Equal(t, http.StatusOK, res.StatusCode, string(body))
+	assert.Equal(t, "application/json", res.Header.Get("Content-Type"))
+	assert.Contains(t, string(body), `"replies"`)
+	assert.Contains(t, string(body), `"server":"9.9.9.9:53"`)
+
+	res, err = http.Get(srv.URL + "/query?type=A")
+	assert.Nil(t, err)
+	assert.Equal(t, http.StatusBadRequest, res.StatusCode)
+
+	res, err = http.Get(srv.URL + "/query?name=example.com&server=192.0.2.1&timeout=1s")
+	assert.Nil(t, err)
+	body, _ = io.ReadAll(res.Body)
+	assert.Equal(t, http.StatusBadGateway, res.StatusCode)
+	assert.Contains(t, string(body), "timeout")
+}
+
+func TestDaemonQueryArgs(t *testing.T) {
+	args, err := queryArgs(url.Values{"name": {"example.com"}, "type": {"TXT,MX", "NS"}, "server": {"@1.1.1.1", "9.9.9.9"}, "timeout": {"3s"}})
+	assert.Nil(t, err)
+	assert.Equal(t, []string{"@1.1.1.1", "@9.9.9.9", "TXT", "MX", "NS", "example.com", "--timeout=3s", "--format=json"}, args)
+
+	_, err = queryArgs(url.Values{"name": {"-h"}})
+	assert.NotNil(t, err)
+	_, err = queryArgs(url.Values{"name": {"example.com"}, "timeout": {"soon"}})
+	assert.NotNil(t, err)
+}
+
+func TestDaemonConcurrentQueries(t *testing.T) {
+	srv := httptest.NewServer(daemonMux())
+	defer srv.Close()
+
+	var wg sync.WaitGroup
+	results := make(chan string, 16)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			server := []string{"9.9.9.9", "1.1.1.1"}[i%2]
+			rrType := []string{"A", "TXT", "MX", "NS"}[i%4]
+			res, err := http.Get(srv.URL + "/query?name=example.com&type=" + rrType + "&server=" + server + "&timeout=5s")
+			if err != nil {
+				results <- err.Error()
+				return
+			}
+			body, _ := io.ReadAll(res.Body)
+			if res.StatusCode != http.StatusOK || !strings.Contains(string(body), `"server":"`+server+`:53"`) || !strings.Contains(string(body), `"qtype":`+strconv.Itoa(int(dns.StringToType[rrType]))) {
+				results <- string(body)
+				return
+			}
+			results <- ""
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	for r := range results {
+		assert.Equal(t, "", r)
+	}
 }

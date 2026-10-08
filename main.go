@@ -31,8 +31,6 @@ import (
 
 const defaultServerVar = "Q_DEFAULT_SERVER"
 
-var opts = cli.Flags{}
-
 // Build process flags
 var (
 	version = "dev"
@@ -40,9 +38,10 @@ var (
 	date    = "unknown"
 )
 
-// clearOpts sets the default values for the CLI options
-func clearOpts() {
-	opts = cli.Flags{}
+// newOpts returns the default CLI options. Every driver call gets its own
+// copy so concurrent callers (daemon mode) never share flag state.
+func newOpts() cli.Flags {
+	opts := cli.Flags{}
 	cli.SetDefaultTrueBools(&opts)
 
 	// Enable color output if stdout is a terminal
@@ -55,7 +54,7 @@ func clearOpts() {
 		log.Debug("NO_COLOR set")
 		opts.Color = false
 	}
-	util.UseColor = opts.Color
+	return opts
 }
 
 func txtConcat(m *dns.Msg) {
@@ -64,11 +63,8 @@ func txtConcat(m *dns.Msg) {
 		if answer.Header().Rrtype == dns.TypeTXT {
 			txt := answer.(*dns.TXT)
 
-			// Concat TXT responses if requested
-			if opts.TXTConcat {
-				log.Debugf("Concatenating TXT response: %+v", txt.Txt)
-				txt.Txt = []string{strings.Join(txt.Txt, "")}
-			}
+			log.Debugf("Concatenating TXT response: %+v", txt.Txt)
+			txt.Txt = []string{strings.Join(txt.Txt, "")}
 			answers = append(answers, txt)
 		} else {
 			answers = append(answers, answer)
@@ -250,24 +246,23 @@ func loadConfig() []string {
 }
 
 // driver is the "main" function for this program that accepts a flag slice for testing
-func driver(args []string, out io.Writer) error {
+func driver(opts *cli.Flags, args []string, out io.Writer) error {
 	configArgs := loadConfig()
 	args = append(configArgs, args...)
-	args = cli.SetFalseBooleans(&opts, args)
+	args = cli.SetFalseBooleans(opts, args)
 	args = cli.AddEqualSigns(args)
-	parser := flags.NewParser(&opts, flags.Default)
+	parser := flags.NewParser(opts, flags.Default)
 	parser.Usage = `[OPTIONS] [@server] [type...] [name]
 
 All long form (--) flags can be toggled with the dig-standard +[no]flag notation.`
 	_, err := parser.ParseArgs(args)
 	if err != nil {
-		if !strings.Contains(err.Error(), "Usage") {
-			log.Fatal(err)
-		}
-		os.Exit(1)
+		return err
 	}
-	cli.ParsePlusFlags(&opts, args)
-	util.UseColor = opts.Color
+	cli.ParsePlusFlags(opts, args)
+	if util.UseColor != opts.Color {
+		util.UseColor = opts.Color
+	}
 
 	log.SetReportTimestamp(false)
 
@@ -512,9 +507,9 @@ All long form (--) flags can be toggled with the dig-standard +[no]flag notation
 	for rrType := range rrTypes {
 		rrTypesSlice = append(rrTypesSlice, rrType)
 	}
-	msgs := createQuery(opts, rrTypesSlice)
+	msgs := createQuery(*opts, rrTypesSlice)
 
-	errChan := make(chan error)
+	errChan := make(chan error, 1)
 
 	go func() {
 		var entries []*output.Entry
@@ -544,7 +539,7 @@ All long form (--) flags can be toggled with the dig-standard +[no]flag notation
 			}
 
 			// Create transport
-			txp, err := newTransport(server, transportType, tlsConfig)
+			txp, err := newTransport(opts, server, transportType, tlsConfig)
 			if err != nil {
 				if multiServer {
 					log.Warnf("Skipping server %s (transport error): %v", server, err)
@@ -646,7 +641,7 @@ All long form (--) flags can be toggled with the dig-standard +[no]flag notation
 
 		printer := output.Printer{
 			Out:  out,
-			Opts: &opts,
+			Opts: opts,
 		}
 
 		if (opts.NSID && (opts.Format == output.FormatPretty || opts.Format == output.FormatColumn)) || opts.NSIDOnly {
@@ -694,8 +689,23 @@ All long form (--) flags can be toggled with the dig-standard +[no]flag notation
 }
 
 func main() {
-	clearOpts()
-	if err := driver(os.Args[1:], os.Stdout); err != nil {
+	if len(os.Args) > 1 && os.Args[1] == "daemon" {
+		addr := defaultDaemonAddr
+		if len(os.Args) > 2 {
+			addr = os.Args[2]
+		}
+		if err := runDaemon(addr); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	opts := newOpts()
+	if err := driver(&opts, os.Args[1:], os.Stdout); err != nil {
+		// go-flags has already printed the usage text
+		if strings.Contains(err.Error(), "Usage") {
+			os.Exit(1)
+		}
 		log.Fatal(err)
 	}
 }

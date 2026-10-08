@@ -119,7 +119,7 @@ func createQuery(opts cli.Flags, rrTypes []uint16) []dns.Msg {
 }
 
 // newTransport creates a new transport based on local options
-func newTransport(server string, transportType transport.Type, tlsConfig *tls.Config) (*transport.Transport, error) {
+func newTransport(opts *cli.Flags, server string, transportType transport.Type, tlsConfig *tls.Config) (*transport.Transport, error) {
 	var ts transport.Transport
 
 	common := transport.Common{
