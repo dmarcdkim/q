@@ -119,7 +119,7 @@ func createQuery(opts cli.Flags, rrTypes []uint16) []dns.Msg {
 }
 
 // newTransport creates a new transport based on local options
-func newTransport(server string, transportType transport.Type, tlsConfig *tls.Config) (*transport.Transport, error) {
+func newTransport(opts *cli.Flags, server string, transportType transport.Type, tlsConfig *tls.Config) (*transport.Transport, error) {
 	var ts transport.Transport
 
 	common := transport.Common{
@@ -162,6 +162,7 @@ func newTransport(server string, transportType transport.Type, tlsConfig *tls.Co
 				HTTP3:     opts.HTTP3,
 				NoPMTUd:   !opts.PMTUD,
 				Headers:   headers,
+				Timeout:   opts.Timeout,
 			}
 		}
 	case transport.TypeDNSCrypt:
@@ -201,6 +202,7 @@ func newTransport(server string, transportType transport.Type, tlsConfig *tls.Co
 		ts = &transport.TLS{
 			Common:    common,
 			TLSConfig: tlsConfig,
+			Timeout:   opts.Timeout,
 		}
 	case transport.TypeTCP:
 		log.Debugf("Using TCP transport: %s", server)

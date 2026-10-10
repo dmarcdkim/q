@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/miekg/dns"
 )
@@ -12,6 +13,7 @@ import (
 type TLS struct {
 	Common
 	TLSConfig *tls.Config
+	Timeout   time.Duration
 	conn      *tls.Conn
 }
 
@@ -19,7 +21,7 @@ func (t *TLS) Exchange(msg *dns.Msg) (*dns.Msg, error) {
 	if t.conn == nil || !t.ReuseConn {
 		var err error
 		t.conn, err = tls.DialWithDialer(
-			&net.Dialer{},
+			&net.Dialer{Timeout: t.Timeout},
 			"tcp",
 			t.Server,
 			t.TLSConfig,
@@ -29,6 +31,12 @@ func (t *TLS) Exchange(msg *dns.Msg) (*dns.Msg, error) {
 		}
 		if err = t.conn.Handshake(); err != nil {
 			return nil, err
+		}
+	}
+
+	if t.Timeout > 0 {
+		if err := t.conn.SetDeadline(time.Now().Add(t.Timeout)); err != nil {
+			return nil, fmt.Errorf("set deadline for %s: %v", t.Server, err)
 		}
 	}
 

@@ -1,6 +1,8 @@
 package transport
 
 import (
+	"fmt"
+
 	"github.com/ameshkov/dnscrypt/v2"
 	"github.com/charmbracelet/log"
 	"github.com/jedisct1/go-dnsstamps"
@@ -21,7 +23,7 @@ type DNSCrypt struct {
 	client   *dnscrypt.Client
 }
 
-func (d *DNSCrypt) setup() {
+func (d *DNSCrypt) setup() error {
 	if d.client == nil || d.resolver == nil || !d.ReuseConn {
 		d.client = &dnscrypt.Client{
 			UDPSize: d.UDPSize,
@@ -30,7 +32,7 @@ func (d *DNSCrypt) setup() {
 		if d.ServerStamp == "" {
 			stamp, err := dnsstamps.NewDNSCryptServerStampFromLegacy(d.Server, d.PublicKey, d.ProviderName, 0)
 			if err != nil {
-				log.Fatalf("failed to create stamp from provider information: %s", err)
+				return fmt.Errorf("failed to create stamp from provider information: %s", err)
 			}
 			d.ServerStamp = stamp.String()
 			log.Debugf("Created DNS stamp from manual DNSCrypt configuration: %s", d.ServerStamp)
@@ -39,7 +41,7 @@ func (d *DNSCrypt) setup() {
 		// Resolve server DNS stamp
 		ro, err := d.client.Dial(d.ServerStamp)
 		if err != nil {
-			log.Fatalf("failed to dial DNSCrypt server: %s", err)
+			return fmt.Errorf("failed to dial DNSCrypt server: %s", err)
 		}
 		d.resolver = ro
 	}
@@ -48,10 +50,13 @@ func (d *DNSCrypt) setup() {
 	} else {
 		d.client.Net = "udp"
 	}
+	return nil
 }
 
 func (d *DNSCrypt) Exchange(msg *dns.Msg) (*dns.Msg, error) {
-	d.setup()
+	if err := d.setup(); err != nil {
+		return nil, err
+	}
 	return d.client.Exchange(msg, d.resolver)
 }
 
