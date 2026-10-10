@@ -162,6 +162,7 @@ func newTransport(opts *cli.Flags, server string, transportType transport.Type, 
 				HTTP3:     opts.HTTP3,
 				NoPMTUd:   !opts.PMTUD,
 				Headers:   headers,
+				Timeout:   opts.Timeout,
 			}
 		}
 	case transport.TypeDNSCrypt:
@@ -201,6 +202,7 @@ func newTransport(opts *cli.Flags, server string, transportType transport.Type, 
 		ts = &transport.TLS{
 			Common:    common,
 			TLSConfig: tlsConfig,
+			Timeout:   opts.Timeout,
 		}
 	case transport.TypeTCP:
 		log.Debugf("Using TCP transport: %s", server)

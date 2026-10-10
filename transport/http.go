@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/charmbracelet/log"
 	"github.com/miekg/dns"
@@ -24,16 +25,19 @@ type HTTP struct {
 	HTTP2, HTTP3 bool
 	NoPMTUd      bool
 	Headers      map[string][]string
+	Timeout      time.Duration
 
 	conn *http.Client
 }
 
 func (h *HTTP) Exchange(m *dns.Msg) (*dns.Msg, error) {
 	if h.conn == nil || !h.ReuseConn {
-		transport := http.DefaultTransport.(*http.Transport)
+		// Clone: the default transport is shared by the whole process
+		transport := http.DefaultTransport.(*http.Transport).Clone()
 		transport.TLSClientConfig = h.TLSConfig
 		h.conn = &http.Client{
 			Transport: transport,
+			Timeout:   h.Timeout,
 		}
 		if h.HTTP2 {
 			log.Debug("Using HTTP/2")

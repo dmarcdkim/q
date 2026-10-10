@@ -16,6 +16,7 @@ import (
 
 	"github.com/charmbracelet/log"
 
+	"github.com/natesales/q/cli"
 	"github.com/natesales/q/util"
 )
 
@@ -29,7 +30,9 @@ func runDaemon(addr string) error {
 	network := "tcp"
 	if strings.Contains(addr, "/") {
 		network = "unix"
-		_ = os.Remove(addr)
+		if err := removeStaleSocket(addr); err != nil {
+			return err
+		}
 	}
 	listener, err := net.Listen(network, addr)
 	if err != nil {
@@ -37,20 +40,42 @@ func runDaemon(addr string) error {
 	}
 
 	server := &http.Server{Handler: daemonMux(), ReadHeaderTimeout: 5 * time.Second}
+	drained := make(chan error, 1)
 	go func() {
 		quit := make(chan os.Signal, 1)
 		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 		<-quit
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_ = server.Shutdown(ctx)
+		drained <- server.Shutdown(ctx)
 	}()
 
 	log.Infof("q daemon listening on %s", listener.Addr())
 	if err := server.Serve(listener); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
-	return nil
+	// Serve returns as soon as Shutdown starts: wait for the in-flight requests.
+	return <-drained
+}
+
+// removeStaleSocket clears the socket a previous daemon left at path. It
+// refuses a path that is not a socket, and a socket that still answers.
+func removeStaleSocket(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("%s exists and is not a socket", path)
+	}
+	if conn, err := net.DialTimeout("unix", path, time.Second); err == nil {
+		_ = conn.Close()
+		return fmt.Errorf("%s is in use by another process", path)
+	}
+	return os.Remove(path)
 }
 
 func daemonMux() *http.ServeMux {
@@ -71,14 +96,12 @@ func daemonMux() *http.ServeMux {
 // type and server may be repeated or comma-separated. A failed lookup is a 502
 // whose body is the CLI's error message.
 func queryHandler(w http.ResponseWriter, r *http.Request) {
-	args, err := queryArgs(r.URL.Query())
+	opts, args, err := queryOpts(r.URL.Query())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	opts := newOpts()
-	opts.Color = false
 	var buf bytes.Buffer
 	if err := driver(&opts, args, &buf); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -89,30 +112,33 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(buf.Bytes())
 }
 
-func queryArgs(query url.Values) ([]string, error) {
-	name := query.Get("name")
-	if name == "" || strings.HasPrefix(name, "-") || strings.ContainsAny(name, " \t@/") {
-		return nil, fmt.Errorf("name parameter is required and must be a DNS name")
+// queryOpts maps a request onto the CLI flags. name, type and server are set
+// on the flags directly, never passed as arguments, so the CLI parser can
+// neither read them as options nor infer a different target from them.
+func queryOpts(query url.Values) (cli.Flags, []string, error) {
+	opts := newOpts()
+	opts.Color = false
+
+	opts.Name = query.Get("name")
+	if opts.Name == "" || strings.HasPrefix(opts.Name, "-") || strings.ContainsAny(opts.Name, " \t@/") {
+		return opts, nil, fmt.Errorf("name parameter is required and must be a DNS name")
+	}
+	opts.Types = splitList(query["type"])
+	if _, err := cli.ParseRRTypes(opts.Types); err != nil {
+		return opts, nil, err
+	}
+	for _, server := range splitList(query["server"]) {
+		opts.Server = append(opts.Server, strings.TrimPrefix(server, "@"))
 	}
 
-	var args []string
-	for _, server := range splitList(query["server"]) {
-		args = append(args, "@"+strings.TrimPrefix(server, "@"))
-	}
-	for _, rrType := range splitList(query["type"]) {
-		if strings.HasPrefix(rrType, "-") {
-			return nil, fmt.Errorf("invalid type %q", rrType)
-		}
-		args = append(args, rrType)
-	}
-	args = append(args, name)
+	args := []string{"--format=json"}
 	if timeout := query.Get("timeout"); timeout != "" {
 		if _, err := time.ParseDuration(timeout); err != nil {
-			return nil, fmt.Errorf("invalid timeout %q", timeout)
+			return opts, nil, fmt.Errorf("invalid timeout %q", timeout)
 		}
 		args = append(args, "--timeout="+timeout)
 	}
-	return append(args, "--format=json"), nil
+	return opts, args, nil
 }
 
 func splitList(values []string) []string {

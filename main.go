@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -703,7 +704,8 @@ func main() {
 	opts := newOpts()
 	if err := driver(&opts, os.Args[1:], os.Stdout); err != nil {
 		// go-flags has already printed the usage text
-		if strings.Contains(err.Error(), "Usage") {
+		var flagsErr *flags.Error
+		if errors.As(err, &flagsErr) && flagsErr.Type == flags.ErrHelp {
 			os.Exit(1)
 		}
 		log.Fatal(err)

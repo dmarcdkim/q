@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,7 +14,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
@@ -722,22 +727,224 @@ func TestDaemonQuery(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Equal(t, http.StatusBadRequest, res.StatusCode)
 
-	res, err = http.Get(srv.URL + "/query?name=example.com&server=192.0.2.1&timeout=1s")
+	res, err = http.Get(srv.URL + "/query?name=example.com&server=" + silentUDP(t).LocalAddr().String() + "&timeout=1s")
 	assert.Nil(t, err)
 	body, _ = io.ReadAll(res.Body)
 	assert.Equal(t, http.StatusBadGateway, res.StatusCode)
 	assert.Contains(t, string(body), "timeout")
 }
 
-func TestDaemonQueryArgs(t *testing.T) {
-	args, err := queryArgs(url.Values{"name": {"example.com"}, "type": {"TXT,MX", "NS"}, "server": {"@1.1.1.1", "9.9.9.9"}, "timeout": {"3s"}})
+// silentUDP opens a loopback socket that never answers. An unroutable address
+// does not work as a silent server: some networks answer DNS for any destination.
+func silentUDP(t *testing.T) net.PacketConn {
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	assert.Nil(t, err)
-	assert.Equal(t, []string{"@1.1.1.1", "@9.9.9.9", "TXT", "MX", "NS", "example.com", "--timeout=3s", "--format=json"}, args)
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
 
-	_, err = queryArgs(url.Values{"name": {"-h"}})
+// localDNS starts a loopback DNS server that answers every query with an empty reply.
+func localDNS(t *testing.T) string {
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	assert.Nil(t, err)
+	srv := &dns.Server{PacketConn: conn, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		_ = w.WriteMsg(new(dns.Msg).SetReply(r))
+	})}
+	go func() { _ = srv.ActivateAndServe() }()
+	t.Cleanup(func() { _ = srv.Shutdown() })
+	return conn.LocalAddr().String()
+}
+
+func daemonGet(query url.Values) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	daemonMux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/query?"+query.Encode(), nil))
+	return w
+}
+
+func TestDaemonQueryOpts(t *testing.T) {
+	opts, args, err := queryOpts(url.Values{"name": {"example.com"}, "type": {"TXT,MX", "NS"}, "server": {"@1.1.1.1", "9.9.9.9"}, "timeout": {"3s"}})
+	assert.Nil(t, err)
+	assert.Equal(t, "example.com", opts.Name)
+	assert.Equal(t, []string{"TXT", "MX", "NS"}, opts.Types)
+	assert.Equal(t, []string{"1.1.1.1", "9.9.9.9"}, opts.Server)
+	assert.Equal(t, []string{"--format=json", "--timeout=3s"}, args)
+
+	_, _, err = queryOpts(url.Values{"name": {"-h"}})
 	assert.NotNil(t, err)
-	_, err = queryArgs(url.Values{"name": {"example.com"}, "timeout": {"soon"}})
+	_, _, err = queryOpts(url.Values{"name": {"example.com"}, "timeout": {"soon"}})
 	assert.NotNil(t, err)
+
+	// A type is an RR type, never a CLI option in either boolean notation
+	for _, rrType := range []string{"-V", "+recaxfr", "+not-a-type", "recaxfr=true", "bogus"} {
+		_, _, err = queryOpts(url.Values{"name": {"example.com"}, "type": {rrType}})
+		assert.NotNil(t, err, rrType)
+	}
+}
+
+// The upstream is asked for exactly the name and type of the request, also
+// when a value looks like a CLI option, an RR type or a class.
+func TestDaemonQueryStaysLiteral(t *testing.T) {
+	server := localDNS(t)
+	for _, tc := range []struct {
+		name, rrType string
+		qtype        uint16
+	}{
+		{"example.com", "65", dns.TypeHTTPS},
+		{"example.com", "TYPE65", dns.TypeHTTPS},
+		{"mx", "A", dns.TypeA},
+		{"ch", "A", dns.TypeA},
+		{"+abcd", "A", dns.TypeA},
+		{"true", "A", dns.TypeA},
+	} {
+		w := daemonGet(url.Values{"name": {tc.name}, "type": {tc.rrType}, "server": {server}, "timeout": {"2s"}})
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), `"question":[{"name":"`+tc.name+`.","qtype":`+strconv.Itoa(int(tc.qtype))+`,"qclass":1}]`)
+	}
+}
+
+// A lookup that fails is a 502, it never stops the process.
+func TestDaemonDNSCryptFailure(t *testing.T) {
+	// DNSCrypt stamp for 127.0.0.1:1, where nothing listens
+	stamp := "sdns://AQAAAAAAAAAACzEyNy4wLjAuMToxINErR_JS3PLCu_iZEIbq95zkSV2LFsigxDIuUso_OQhzFDIuZG5zY3J5cHQtY2VydC50ZXN0"
+	w := daemonGet(url.Values{"name": {"example.com"}, "type": {"A"}, "server": {stamp}, "timeout": {"1s"}})
+	assert.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
+}
+
+func TestDaemonTimeoutCancelsUpstream(t *testing.T) {
+	var reached, active atomic.Int32
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		reached.Add(1)
+		active.Add(1)
+		defer active.Add(-1)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer upstream.Close()
+	defer close(release)
+
+	w := daemonGet(url.Values{"name": {"example.com"}, "type": {"A"}, "server": {upstream.URL}, "timeout": {"100ms"}})
+	assert.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
+	assert.Eventually(t, func() bool { return reached.Load() == 1 && active.Load() == 0 }, 2*time.Second, 10*time.Millisecond,
+		"upstream request is still open after the lookup timed out")
+}
+
+func TestMainTLSTimeoutClosesConnection(t *testing.T) {
+	certs := httptest.NewTLSServer(nil)
+	defer certs.Close()
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: certs.TLS.Certificates})
+	assert.Nil(t, err)
+	defer listener.Close()
+
+	// Accept the query and never answer it
+	hungUp := make(chan struct{})
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(io.Discard, conn)
+		close(hungUp)
+	}()
+
+	_, err = run("-q", "example.com", "-t", "A", "-s", "tls://"+listener.Addr().String(), "--timeout", "200ms", "--tls-insecure-skip-verify")
+	assert.NotNil(t, err)
+	select {
+	case <-hungUp:
+	case <-time.After(2 * time.Second):
+		t.Error("upstream connection is still open after the lookup timed out")
+	}
+}
+
+func TestDaemonDoHKeepsDefaultTransport(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	// The first request through the default transport initializes it
+	res, err := http.Get(upstream.URL)
+	assert.Nil(t, err)
+	_ = res.Body.Close()
+	before := http.DefaultTransport.(*http.Transport).TLSClientConfig
+
+	w := daemonGet(url.Values{"name": {"example.com"}, "type": {"A"}, "server": {upstream.URL}, "timeout": {"2s"}})
+	assert.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
+	assert.Same(t, before, http.DefaultTransport.(*http.Transport).TLSClientConfig)
+}
+
+func TestDaemonRemoveStaleSocket(t *testing.T) {
+	// Not t.TempDir: its path is too long for a Unix socket on macOS
+	dir, err := os.MkdirTemp("", "q")
+	assert.Nil(t, err)
+	defer os.RemoveAll(dir)
+
+	file := filepath.Join(dir, "notes")
+	assert.Nil(t, os.WriteFile(file, []byte("keep me"), 0600))
+	assert.NotNil(t, removeStaleSocket(file))
+	content, err := os.ReadFile(file)
+	assert.Nil(t, err)
+	assert.Equal(t, "keep me", string(content))
+
+	live := filepath.Join(dir, "live.sock")
+	listener, err := net.Listen("unix", live)
+	assert.Nil(t, err)
+	defer listener.Close()
+	assert.NotNil(t, removeStaleSocket(live))
+	assert.FileExists(t, live)
+
+	stale := filepath.Join(dir, "stale.sock")
+	left, err := net.Listen("unix", stale)
+	assert.Nil(t, err)
+	left.(*net.UnixListener).SetUnlinkOnClose(false)
+	assert.Nil(t, left.Close())
+	assert.Nil(t, removeStaleSocket(stale))
+	assert.NoFileExists(t, stale)
+
+	assert.Nil(t, removeStaleSocket(filepath.Join(dir, "missing.sock")))
+}
+
+func TestDaemonWaitsForShutdown(t *testing.T) {
+	silent := silentUDP(t)
+	port, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.Nil(t, err)
+	addr := port.Addr().String()
+	assert.Nil(t, port.Close())
+
+	done := make(chan error, 1)
+	go func() { done <- runDaemon(addr) }()
+	// One connection per request: Shutdown waits 5 seconds for a spare
+	// connection that a client pool opened and never used.
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	assert.Eventually(t, func() bool {
+		res, err := client.Get("http://" + addr + "/health")
+		if err != nil {
+			return false
+		}
+		return res.Body.Close() == nil
+	}, 2*time.Second, 10*time.Millisecond)
+
+	go func() {
+		res, err := client.Get("http://" + addr + "/query?name=example.com&type=A&server=" + silent.LocalAddr().String() + "&timeout=1s")
+		if err == nil {
+			_ = res.Body.Close()
+		}
+	}()
+
+	// The lookup is in flight once its query reaches the upstream
+	assert.Nil(t, silent.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, _, err = silent.ReadFrom(make([]byte, 512))
+	assert.Nil(t, err)
+
+	start := time.Now()
+	self, err := os.FindProcess(os.Getpid())
+	assert.Nil(t, err)
+	assert.Nil(t, self.Signal(syscall.SIGTERM))
+	assert.Nil(t, <-done)
+	assert.GreaterOrEqual(t, time.Since(start), 500*time.Millisecond, "runDaemon returned while a lookup was in flight")
 }
 
 func TestDaemonConcurrentQueries(t *testing.T) {
