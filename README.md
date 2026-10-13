@@ -215,10 +215,10 @@ the `SSLKEYLOGFILE` environment variable is set to a file path.
 
 ## Daemon mode
 
-`q -D [addr] [flags]` keeps one process resident and answers the same lookups over HTTP, so a caller that would otherwise fork `q` per query makes a local request instead. `-D` (`--daemon`) must be the first argument; `addr` is a loopback `host:port` (default `127.0.0.1:8053`) or a filesystem path for a Unix socket. The other flags are read once at start and are the defaults of every lookup; a request overrides only name, type, server and timeout, and `~/.qrc` is not read. So `-b` resolves the server hostnames of every lookup through that bootstrap resolver, and `--timeout`, `-s` or `-q` set the defaults a request may omit. `--recaxfr` and `--nsid-only`, whose output is not a lookup's JSON, are refused at start.
+`q -D ADDR [flags]` keeps one process resident and answers the same lookups over HTTP, so a caller that would otherwise fork `q` per query makes a local request instead. `-D` (`--daemon`) must be the first argument and binds the listen address: a loopback `host:port` or a filesystem path for a Unix socket. The other flags are read once at start and are the defaults of every lookup; a request overrides only name, type, server and timeout, and `~/.qrc` is not read. So `-b` resolves the server hostnames of every lookup through that bootstrap resolver, and `--timeout`, `-s` or `-q` set the defaults a request may omit. `--recaxfr` and `--nsid-only`, whose output is not a lookup's JSON, are refused at start.
 
 ```bash
-q -D
+q -D 127.0.0.1:8053
 curl 'http://127.0.0.1:8053/query?name=example.com&type=TXT&type=MX&server=9.9.9.9&timeout=3s'
 curl http://127.0.0.1:8053/health
 ```

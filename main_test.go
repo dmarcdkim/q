@@ -783,7 +783,7 @@ func keepResolver(t *testing.T) {
 // daemonBase is what `q -D` parses: the flag defaults, applied once.
 func daemonBase(t *testing.T) cli.Flags {
 	opts := newOpts()
-	_, err := configure(&opts, []string{"-D"})
+	_, err := configure(&opts, []string{"-D", "127.0.0.1:0"})
 	assert.NoError(t, err)
 	return opts
 }
@@ -1039,31 +1039,27 @@ func TestDaemonFlag(t *testing.T) {
 	opts := newOpts()
 	rest, err := configure(&opts, []string{"-D", "127.0.0.1:0", "-b", "127.0.0.1:5353", "+noedns"})
 	assert.NoError(t, err)
-	assert.True(t, opts.Daemon)
-	assert.Equal(t, "127.0.0.1:0", daemonAddr(rest))
+	assert.Empty(t, rest)
+	assert.Equal(t, "127.0.0.1:0", opts.Daemon)
 	assert.Equal(t, "127.0.0.1:5353", opts.BootstrapServer)
 	assert.False(t, opts.EDNS)
 
-	// The address may follow the flags, in either notation
-	for _, args := range [][]string{{"--daemon", "--bootstrap-server=127.0.0.1:5353", "/run/q.sock"}, {"+daemon", "+noedns", "/run/q.sock"}} {
+	// The address binds to the flag in each of go-flags' spellings
+	for _, args := range [][]string{
+		{"--daemon", "/run/q.sock", "--bootstrap-server=127.0.0.1:5353"}, {"--daemon=/run/q.sock", "+noedns"}, {"-D/run/q.sock"},
+	} {
 		opts = newOpts()
-		rest, err = configure(&opts, args)
+		_, err = configure(&opts, args)
 		assert.NoError(t, err, args)
-		assert.True(t, opts.Daemon, args)
-		assert.Equal(t, "/run/q.sock", daemonAddr(rest), args)
+		assert.Equal(t, "/run/q.sock", opts.Daemon, args)
 	}
 
-	opts = newOpts()
-	rest, err = configure(&opts, []string{"-D"})
-	assert.NoError(t, err)
-	assert.Equal(t, defaultDaemonAddr, daemonAddr(rest))
-
-	// Anywhere else -D is an error, as are a second positional, an unknown
-	// flag, and the flags that cannot serve a lookup.
+	// Anywhere else -D is an error, as are a missing address, a positional, an
+	// unknown flag, and the flags that cannot serve a lookup.
 	for _, args := range [][]string{
-		{"-v", "-D"}, {"example.com", "--daemon"}, {"-b", "127.0.0.1:5353", "-D", "127.0.0.1:0"}, {"A", "+daemon"},
-		{"-D", "127.0.0.1:0", "extra"}, {"-D", "--no-such-flag"},
-		{"-D", "--recaxfr"}, {"-D", "--nsid-only"}, {"-D", "--subnet=bogus"},
+		{"-v", "-D", "127.0.0.1:0"}, {"example.com", "--daemon=127.0.0.1:0"}, {"-b", "127.0.0.1:5353", "-D", "127.0.0.1:0"}, {"A", "--daemon", "127.0.0.1:0"},
+		{"-D"}, {"-D", "-b", "127.0.0.1:5353"}, {"-D", "127.0.0.1:0", "extra"}, {"-D", "127.0.0.1:0", "--no-such-flag"},
+		{"-D", "127.0.0.1:0", "--recaxfr"}, {"-D", "127.0.0.1:0", "--nsid-only"}, {"-D", "127.0.0.1:0", "-N=true"}, {"-D", "127.0.0.1:0", "--subnet=bogus"},
 	} {
 		opts = newOpts()
 		_, err = configure(&opts, args)
@@ -1082,7 +1078,7 @@ func TestConfigurePositionals(t *testing.T) {
 	assert.Equal(t, "127.0.0.1:5353", opts.BootstrapServer)
 	assert.Equal(t, 3*time.Second, opts.Timeout)
 	assert.False(t, opts.EDNS)
-	assert.False(t, opts.Daemon)
+	assert.Empty(t, opts.Daemon)
 }
 
 // A service runs on its own flags: ~/.qrc, the CLI defaults, is not read, and
@@ -1095,20 +1091,21 @@ func TestDaemonIgnoresConfig(t *testing.T) {
 	assert.NoError(t, os.WriteFile(config, []byte("-b 127.0.0.1:1\n--timeout 4s\n@1.1.1.1\n"), 0o600))
 
 	opts := newOpts()
-	rest, err := configure(&opts, []string{"-D", "-b", "127.0.0.1:5353"})
+	rest, err := configure(&opts, []string{"-D", "127.0.0.1:0", "-b", "127.0.0.1:5353"})
 	assert.NoError(t, err)
-	assert.Equal(t, defaultDaemonAddr, daemonAddr(rest))
+	assert.Empty(t, rest)
+	assert.Equal(t, "127.0.0.1:0", opts.Daemon)
 	assert.Equal(t, "127.0.0.1:5353", opts.BootstrapServer)
 	assert.Equal(t, 10*time.Second, opts.Timeout)
 
 	opts = newOpts()
 	rest, err = configure(&opts, []string{"example.com"})
 	assert.NoError(t, err)
-	assert.False(t, opts.Daemon)
+	assert.Empty(t, opts.Daemon)
 	assert.Equal(t, 4*time.Second, opts.Timeout)
 	assert.Equal(t, []string{"@1.1.1.1", "example.com"}, rest)
 
-	assert.NoError(t, os.WriteFile(config, []byte("--daemon\n"), 0o600))
+	assert.NoError(t, os.WriteFile(config, []byte("--daemon=127.0.0.1:0\n"), 0o600))
 	opts = newOpts()
 	_, err = configure(&opts, []string{"example.com"})
 	assert.Error(t, err)
@@ -1123,9 +1120,9 @@ func TestDaemonBootstrapResolver(t *testing.T) {
 	request := url.Values{"name": {"example.com"}, "type": {"A"}, "server": {"ns.test:" + port}, "timeout": {"2s"}}
 
 	opts := newOpts()
-	_, err = configure(&opts, []string{"-D", "-b", loopbackDNS(t)})
+	_, err = configure(&opts, []string{"-D", "127.0.0.1:0", "-b", loopbackDNS(t)})
 	assert.NoError(t, err)
-	assert.True(t, opts.Daemon)
+	assert.Equal(t, "127.0.0.1:0", opts.Daemon)
 	w := daemonGet(opts, request)
 	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	assert.Contains(t, w.Body.String(), `"replies"`)
@@ -1136,7 +1133,7 @@ func TestDaemonBootstrapResolver(t *testing.T) {
 		_ = w.WriteMsg(new(dns.Msg).SetRcode(r, dns.RcodeRefused))
 	})
 	opts = newOpts()
-	_, err = configure(&opts, []string{"-D", "-b", refusing})
+	_, err = configure(&opts, []string{"-D", "127.0.0.1:0", "-b", refusing})
 	assert.NoError(t, err)
 	w = daemonGet(opts, request)
 	assert.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
@@ -1177,4 +1174,57 @@ func TestDriverServesDaemon(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Nil(t, self.Signal(syscall.SIGTERM))
 	assert.Nil(t, <-done)
+}
+
+// The NS type asks for the referral sections however it is given.
+func TestNSFlagReferral(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	server := serveDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg).SetReply(r)
+		m.Ns = []dns.RR{&dns.NS{
+			Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 60},
+			Ns:  "ns.example.com.",
+		}}
+		_ = w.WriteMsg(m)
+	})
+	for _, args := range [][]string{{"-t", "NS", "example.com"}, {"NS", "example.com"}} {
+		opts := newOpts()
+		var out bytes.Buffer
+		args = append(args, "--server="+server, "--format=raw")
+		assert.NoError(t, driver(&opts, args, &out), args)
+		assert.Contains(t, out.String(), "ns.example.com.", args)
+	}
+}
+
+// A server given to -s or --server may carry the @ of the positional form.
+func TestSeparatedServerPrefix(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	server := localDNS(t)
+	for _, flag := range []string{"-s", "--server"} {
+		opts := newOpts()
+		args := []string{flag, "@" + server, "-t", "A", "example.com", "--timeout=1s"}
+		assert.NoError(t, driver(&opts, args, io.Discard), args)
+		assert.Equal(t, []string{server}, opts.Server, args)
+	}
+}
+
+// A short flag's value may begin with +: it is the flag's, not a +[no]flag.
+func TestLiteralPlusValues(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	server := localDNS(t)
+	for _, args := range [][]string{{"-q", "+edns", "--type=A"}, {"-t", "+1", "--qname=example.com"}} {
+		opts := newOpts()
+		args = append(args, "--server="+server, "--format=json")
+		assert.NoError(t, driver(&opts, args, io.Discard), args)
+	}
+}
+
+// Short boolean names are case-sensitive: -d is DNSSEC, -S the statistics.
+func TestShortBooleanCase(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	opts := newOpts()
+	_, err := configure(&opts, []string{"-S=true", "-d=false", "example.com"})
+	assert.NoError(t, err)
+	assert.True(t, opts.ShowStats)
+	assert.False(t, opts.DNSSEC)
 }

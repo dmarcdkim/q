@@ -274,8 +274,8 @@ func driver(opts *cli.Flags, args []string, out io.Writer) error {
 		return nil
 	}
 
-	if opts.Daemon {
-		return runDaemon(daemonAddr(rest), *opts)
+	if opts.Daemon != "" {
+		return runDaemon(opts.Daemon, *opts)
 	}
 	return query(opts, rest, out)
 }
@@ -293,30 +293,34 @@ func configure(opts *cli.Flags, args []string) ([]string, error) {
 	}
 	args = cli.SetFalseBooleans(opts, args)
 	args = cli.AddEqualSigns(args)
-	args, plus := splitPlusFlags(args)
 
 	parser := flags.NewParser(opts, flags.Default)
 	parser.Usage = "[OPTIONS] [@server] [type...] [name]"
 	parser.LongDescription = "All long form (--) flags can be toggled with the dig-standard +[no]flag notation. " +
-		"q -D [addr] [OPTIONS] serves lookups over HTTP instead of running one; see --daemon."
+		"q -D ADDR [OPTIONS] serves lookups over HTTP instead of running one; see --daemon."
 	rest, err := parser.ParseArgs(args)
 	if err != nil {
 		return nil, err
 	}
+	rest, plus := splitPlusFlags(rest)
 	cli.ParsePlusFlags(opts, plus)
 
-	if opts.Daemon != daemon {
+	if (opts.Daemon != "") != daemon {
 		return nil, fmt.Errorf("-D/--daemon must be the first argument")
 	}
-	if opts.Daemon {
-		if len(rest) > 1 {
-			return nil, fmt.Errorf("daemon: unexpected argument %q", rest[1])
+	if daemon {
+		if len(rest) > 0 {
+			return nil, fmt.Errorf("daemon: unexpected argument %q", rest[0])
 		}
 		// Both print for a terminal instead of answering the lookup, and a
 		// failed transfer exits the process.
 		if opts.RecAXFR || opts.NSIDOnly {
 			return nil, fmt.Errorf("daemon: --recaxfr and --nsid-only are CLI-only")
 		}
+	}
+	// The positional form is @server; a -s value may carry the @ too.
+	for i, server := range opts.Server {
+		opts.Server[i] = strings.TrimPrefix(server, "@")
 	}
 	if opts.ClientSubnet != "" {
 		if _, _, err := net.ParseCIDR(opts.ClientSubnet); err != nil {
@@ -351,13 +355,13 @@ func configure(opts *cli.Flags, args []string) ([]string, error) {
 	return rest, nil
 }
 
-// isDaemonFlag reports whether arg is -D in one of its spellings.
+// isDaemonFlag reports whether arg is -D in one of go-flags' spellings:
+// -D, -DADDR, --daemon, --daemon=ADDR.
 func isDaemonFlag(arg string) bool {
-	switch strings.TrimSuffix(arg, "=true") {
-	case "-D", "--daemon", "+daemon":
-		return true
+	if strings.HasPrefix(arg, "--") {
+		return arg == "--daemon" || strings.HasPrefix(arg, "--daemon=")
 	}
-	return false
+	return strings.HasPrefix(arg, "-D")
 }
 
 // splitPlusFlags separates the dig-style +[no]flag tokens, which go-flags
@@ -397,10 +401,6 @@ func query(opts *cli.Flags, args []string, out io.Writer) error {
 		rrType, typeFound := dns.StringToType[strings.ToUpper(arg)]
 		if typeFound {
 			rrTypes[rrType] = true
-			if rrType == dns.TypeNS {
-				opts.ShowAuthority = true
-				opts.ShowAdditional = true
-			}
 		}
 
 		// Set qname if not set by flag
@@ -411,6 +411,12 @@ func query(opts *cli.Flags, args []string, out io.Writer) error {
 			!strings.HasPrefix(arg, "-") { // Not a flag
 			opts.Name = arg
 		}
+	}
+
+	// A referral answers NS in the authority and additional sections
+	if rrTypes[dns.TypeNS] {
+		opts.ShowAuthority = true
+		opts.ShowAdditional = true
 	}
 
 	// Registry lookup (RDAP / port-43 WHOIS)

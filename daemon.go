@@ -20,21 +20,10 @@ import (
 	"github.com/natesales/q/util"
 )
 
-// Loopback only: the daemon speaks for whoever can reach it, so it must not
-// be exposed beyond the host it serves.
-const defaultDaemonAddr = "127.0.0.1:8053"
-
-// daemonAddr is the listen address: the one positional of `q -D [addr]`, else
-// the default.
-func daemonAddr(rest []string) string {
-	if len(rest) > 0 {
-		return rest[0]
-	}
-	return defaultDaemonAddr
-}
-
 // runDaemon serves DNS queries over HTTP until SIGINT/SIGTERM. addr is a
-// host:port, or a filesystem path for a Unix socket.
+// host:port, or a filesystem path for a Unix socket. Loopback only: the daemon
+// speaks for whoever can reach it, so it must not be exposed beyond the host
+// it serves.
 func runDaemon(addr string, base cli.Flags) error {
 	network := "tcp"
 	if strings.Contains(addr, "/") {

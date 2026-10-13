@@ -33,7 +33,7 @@ type Flags struct {
 	ID               int           `long:"qid" description:"Set query ID (-1 for random)" default:"-1"`
 	BootstrapServer  string        `short:"b" long:"bootstrap-server" description:"DNS server to use for bootstrapping"`
 	BootstrapTimeout time.Duration `long:"bootstrap-timeout" description:"Bootstrapping timeout" default:"5s"`
-	Daemon           bool          `short:"D" long:"daemon" description:"Serve lookups over HTTP on the positional address (default 127.0.0.1:8053); must be the first argument"`
+	Daemon           string        `short:"D" long:"daemon" value-name:"ADDR" description:"Serve lookups over HTTP on ADDR, a loopback host:port or a Unix socket path, instead of running one; must be the first argument"`
 	Cookie           string        `long:"cookie" description:"EDNS0 cookie"`
 
 	// Special query modes
@@ -159,9 +159,10 @@ func SetDefaultTrueBools(opts *Flags) {
 	}
 }
 
-// SetFalseBooleans sets boolean flags to false from a given argument list and returns the remaining arguments
+// SetFalseBooleans applies the --flag=true and --flag=false spellings, which
+// go-flags does not accept for booleans, and returns the other arguments.
 func SetFalseBooleans(opts *Flags, args []string) []string {
-	// Add equal signs to separated flags (e.g. --foo bar becomes --foo=bar)
+	// Join a separated value (e.g. --foo false becomes --foo=false)
 	for i, arg := range args {
 		if len(arg) > 0 && arg[0] == '-' && !strings.Contains(arg, "=") && i+1 < len(args) && (args[i+1] == "true" || args[i+1] == "false") {
 			args[i] = arg + "=" + args[i+1]
@@ -171,28 +172,40 @@ func SetFalseBooleans(opts *Flags, args []string) []string {
 
 	var remainingArgs []string
 	for _, arg := range args {
-		if strings.HasSuffix(arg, "=true") || strings.HasSuffix(arg, "=false") {
-			flag := strings.ToLower(strings.TrimLeft(arg, "-"))
-			flag = strings.TrimSuffix(flag, "=true")
-			flag = strings.TrimSuffix(flag, "=false")
-
-			v := reflect.Indirect(reflect.ValueOf(opts))
-			vT := v.Type()
-			for i := 0; i < v.NumField(); i++ {
-				if vT.Field(i).Type == reflect.TypeOf(true) && (vT.Field(i).Tag.Get("long") == flag || vT.Field(i).Tag.Get("short") == flag) {
-					boolState := strings.HasSuffix(arg, "=true")
-					// log.Debugf("Setting %s to %t", arg, boolState)
-					reflect.ValueOf(opts).Elem().Field(i).SetBool(boolState)
-					break
-				}
-			}
-		} else {
+		state := strings.HasSuffix(arg, "=true")
+		if !state && !strings.HasSuffix(arg, "=false") {
+			remainingArgs = append(remainingArgs, arg)
+			continue
+		}
+		name := strings.TrimLeft(arg, "-")
+		name = name[:strings.LastIndex(name, "=")]
+		if !setBool(opts, name, state) {
+			// Not a boolean of ours: go-flags reports an unknown flag, or
+			// takes the value for the flag that does want one.
 			remainingArgs = append(remainingArgs, arg)
 		}
 	}
-
-	// log.Debugf("remaining args: %v", remainingArgs)
 	return remainingArgs
+}
+
+// setBool sets the boolean flag with that long name (case-insensitive) or
+// short name (case-sensitive: -d and -D are different flags) and reports
+// whether there is one.
+func setBool(opts *Flags, name string, state bool) bool {
+	v := reflect.Indirect(reflect.ValueOf(opts))
+	vT := v.Type()
+	for i := 0; i < v.NumField(); i++ {
+		field := vT.Field(i)
+		if field.Type != reflect.TypeOf(true) {
+			continue
+		}
+		long, short := field.Tag.Get("long"), field.Tag.Get("short")
+		if (long != "" && strings.EqualFold(long, name)) || (short != "" && short == name) {
+			v.Field(i).SetBool(state)
+			return true
+		}
+	}
+	return false
 }
 
 // ParseRRTypes parses a list of RR types in string format ("A", "AAAA", etc.) or integer format (1, 28, etc.)
