@@ -264,17 +264,52 @@ func loadConfig() []string {
 
 // driver is the "main" function for this program that accepts a flag slice for testing
 func driver(opts *cli.Flags, args []string, out io.Writer) error {
-	configArgs := loadConfig()
-	args = append(configArgs, args...)
-	args = cli.SetFalseBooleans(opts, args)
-	args = cli.AddEqualSigns(args)
-	parser := flags.NewParser(opts, flags.Default)
-	parser.Usage = `[OPTIONS] [@server] [type...] [name]
-
-All long form (--) flags can be toggled with the dig-standard +[no]flag notation.`
-	_, err := parser.ParseArgs(args)
+	args, daemon, err := configure(opts, args)
 	if err != nil {
 		return err
+	}
+
+	if opts.ShowVersion {
+		util.MustWritef(out, "https://github.com/natesales/q version %s (%s %s)\n", version, commit, date)
+		return nil
+	}
+
+	if daemon != nil {
+		return runDaemon(daemon.Args.Addr, *opts)
+	}
+	return query(opts, args, out)
+}
+
+// configure reads ~/.qrc and args into opts and applies the flags that shape
+// the process: color, log level and the bootstrap resolver. It returns the
+// processed args and the daemon command when args select it.
+func configure(opts *cli.Flags, args []string) ([]string, *daemonCommand, error) {
+	parser := flags.NewParser(opts, flags.Default)
+	parser.Usage = "[OPTIONS] [@server] [type...] [name]"
+	parser.LongDescription = "All long form (--) flags can be toggled with the dig-standard +[no]flag notation."
+	parser.SubcommandsOptional = true
+	daemon := &daemonCommand{}
+	daemon.Args.Addr = defaultDaemonAddr
+	daemonCmd, err := parser.AddCommand("daemon", daemonShort, daemonLong, daemon)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// ~/.qrc holds a user's CLI defaults, options and positionals alike. A
+	// command runs a service on the flags it was started with, and nothing else.
+	if len(args) == 0 || parser.Find(args[0]) == nil {
+		args = append(loadConfig(), args...)
+	}
+	args = cli.SetFalseBooleans(opts, args)
+	args = cli.AddEqualSigns(args)
+	rest, err := parser.ParseArgs(args)
+	if err != nil {
+		return nil, nil, err
+	}
+	if parser.Active != daemonCmd {
+		daemon = nil
+	} else if len(rest) > 0 {
+		return nil, nil, fmt.Errorf("daemon: unexpected argument %q", rest[0])
 	}
 	cli.ParsePlusFlags(opts, args)
 	if util.UseColor != opts.Color {
@@ -290,11 +325,6 @@ All long form (--) flags can be toggled with the dig-standard +[no]flag notation
 		opts.ShowAll = true
 	}
 
-	if opts.ShowVersion {
-		util.MustWritef(out, "https://github.com/natesales/q version %s (%s %s)\n", version, commit, date)
-		return nil
-	}
-
 	if opts.ShowAll {
 		opts.ShowQuestion = true
 		opts.ShowAnswer = true
@@ -306,7 +336,11 @@ All long form (--) flags can be toggled with the dig-standard +[no]flag notation
 	if opts.BootstrapServer != "" {
 		setBootstrapResolver(opts.BootstrapServer, opts.BootstrapTimeout)
 	}
+	return args, daemon, nil
+}
 
+// query runs one lookup with opts, already configured, and writes the result to out.
+func query(opts *cli.Flags, args []string, out io.Writer) error {
 	// Parse requested RR types
 	rrTypes, err := cli.ParseRRTypes(opts.Types)
 	if err != nil {
@@ -691,13 +725,6 @@ All long form (--) flags can be toggled with the dig-standard +[no]flag notation
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "daemon" {
-		if err := runDaemonCommand(os.Args[2:]); err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
-
 	opts := newOpts()
 	if err := driver(&opts, os.Args[1:], os.Stdout); err != nil {
 		// go-flags has already printed the usage text

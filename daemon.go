@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/charmbracelet/log"
-	"github.com/jessevdk/go-flags"
 
 	"github.com/natesales/q/cli"
 	"github.com/natesales/q/util"
@@ -25,35 +24,25 @@ import (
 // be exposed beyond the host it serves.
 const defaultDaemonAddr = "127.0.0.1:8053"
 
-// runDaemonCommand runs `q daemon [addr] [flags]`. A request carries only
-// name, type, server and timeout, so the flags that shape the process, such
-// as the -b bootstrap resolver, are given here and applied once before serving.
-func runDaemonCommand(args []string) error {
-	addr, opts, err := parseDaemonArgs(args)
-	if err != nil {
-		return err
-	}
-	if opts.BootstrapServer != "" {
-		setBootstrapResolver(opts.BootstrapServer, opts.BootstrapTimeout)
-	}
-	return runDaemon(addr)
-}
+const (
+	daemonShort = "Serve lookups over HTTP"
+	daemonLong  = "Serve lookups over HTTP on addr, a loopback host:port or a Unix socket path. " +
+		"The other flags are read once and apply to every lookup; a request overrides name, type, server and timeout. ~/.qrc is not read."
+)
 
-func parseDaemonArgs(args []string) (string, cli.Flags, error) {
-	addr := defaultDaemonAddr
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		addr, args = args[0], args[1:]
-	}
-	opts := newOpts()
-	parser := flags.NewParser(&opts, flags.Default)
-	parser.Usage = "daemon [addr] [OPTIONS]"
-	_, err := parser.ParseArgs(cli.AddEqualSigns(args))
-	return addr, opts, err
+// daemonCommand is `q daemon [addr]`. A request carries only name, type,
+// server and timeout, so the flags that shape the process, such as the -b
+// bootstrap resolver, are given on the command line and applied once before
+// serving; the parsed flags are the base of every request.
+type daemonCommand struct {
+	Args struct {
+		Addr string `positional-arg-name:"addr" description:"host:port or Unix socket path (default 127.0.0.1:8053)"`
+	} `positional-args:"yes"`
 }
 
 // runDaemon serves DNS queries over HTTP until SIGINT/SIGTERM. addr is a
 // host:port, or a filesystem path for a Unix socket.
-func runDaemon(addr string) error {
+func runDaemon(addr string, base cli.Flags) error {
 	network := "tcp"
 	if strings.Contains(addr, "/") {
 		network = "unix"
@@ -66,7 +55,7 @@ func runDaemon(addr string) error {
 		return err
 	}
 
-	server := &http.Server{Handler: daemonMux(), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Handler: daemonMux(base), ReadHeaderTimeout: 5 * time.Second}
 	drained := make(chan error, 1)
 	go func() {
 		quit := make(chan os.Signal, 1)
@@ -105,7 +94,7 @@ func removeStaleSocket(path string) error {
 	return os.Remove(path)
 }
 
-func daemonMux() *http.ServeMux {
+func daemonMux(base cli.Flags) *http.ServeMux {
 	// Requests always print JSON, so the color global is never written again
 	// once the server is up.
 	util.UseColor = false
@@ -114,7 +103,7 @@ func daemonMux() *http.ServeMux {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
-	mux.HandleFunc("GET /query", queryHandler)
+	mux.HandleFunc("GET /query", func(w http.ResponseWriter, r *http.Request) { queryHandler(base, w, r) })
 	return mux
 }
 
@@ -122,15 +111,15 @@ func daemonMux() *http.ServeMux {
 // with the same JSON the CLI prints for `q @1.1.1.1 TXT MX example.com --timeout=3s --format=json`.
 // type and server may be repeated or comma-separated. A failed lookup is a 502
 // whose body is the CLI's error message.
-func queryHandler(w http.ResponseWriter, r *http.Request) {
-	opts, args, err := queryOpts(r.URL.Query())
+func queryHandler(base cli.Flags, w http.ResponseWriter, r *http.Request) {
+	opts, err := queryOpts(base, r.URL.Query())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	var buf bytes.Buffer
-	if err := driver(&opts, args, &buf); err != nil {
+	if err := query(&opts, nil, &buf); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -139,33 +128,38 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(buf.Bytes())
 }
 
-// queryOpts maps a request onto the CLI flags. name, type and server are set
-// on the flags directly, never passed as arguments, so the CLI parser can
-// neither read them as options nor infer a different target from them.
-func queryOpts(query url.Values) (cli.Flags, []string, error) {
-	opts := newOpts()
-	opts.Color = false
+// queryOpts lays a request over the base flags. name, type and server are set
+// on the flags directly, never parsed as arguments, so a value can neither be
+// read as an option nor infer a different target. Slices are replaced, never
+// appended to, so concurrent requests share nothing with base.
+func queryOpts(base cli.Flags, query url.Values) (cli.Flags, error) {
+	opts := base
+	opts.Format = "json"
 
 	opts.Name = query.Get("name")
 	if opts.Name == "" || strings.HasPrefix(opts.Name, "-") || strings.ContainsAny(opts.Name, " \t@/") {
-		return opts, nil, fmt.Errorf("name parameter is required and must be a DNS name")
+		return opts, fmt.Errorf("name parameter is required and must be a DNS name")
 	}
-	opts.Types = splitList(query["type"])
+	if types := splitList(query["type"]); len(types) > 0 {
+		opts.Types = types
+	}
 	if _, err := cli.ParseRRTypes(opts.Types); err != nil {
-		return opts, nil, err
+		return opts, err
 	}
-	for _, server := range splitList(query["server"]) {
-		opts.Server = append(opts.Server, strings.TrimPrefix(server, "@"))
-	}
-
-	args := []string{"--format=json"}
-	if timeout := query.Get("timeout"); timeout != "" {
-		if _, err := time.ParseDuration(timeout); err != nil {
-			return opts, nil, fmt.Errorf("invalid timeout %q", timeout)
+	if servers := splitList(query["server"]); len(servers) > 0 {
+		opts.Server = nil
+		for _, server := range servers {
+			opts.Server = append(opts.Server, strings.TrimPrefix(server, "@"))
 		}
-		args = append(args, "--timeout="+timeout)
 	}
-	return opts, args, nil
+	if timeout := query.Get("timeout"); timeout != "" {
+		d, err := time.ParseDuration(timeout)
+		if err != nil {
+			return opts, fmt.Errorf("invalid timeout %q", timeout)
+		}
+		opts.Timeout = d
+	}
+	return opts, nil
 }
 
 func splitList(values []string) []string {

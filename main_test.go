@@ -712,7 +712,7 @@ func TestMainMultipleServersAllFail(t *testing.T) {
 }
 
 func TestDaemonQuery(t *testing.T) {
-	srv := httptest.NewServer(daemonMux())
+	srv := httptest.NewServer(daemonMux(daemonBase(t)))
 	defer srv.Close()
 
 	res, err := http.Get(srv.URL + "/query?name=example.com&type=A&server=9.9.9.9&timeout=5s")
@@ -745,38 +745,84 @@ func silentUDP(t *testing.T) net.PacketConn {
 
 // localDNS starts a loopback DNS server that answers every query with an empty reply.
 func localDNS(t *testing.T) string {
+	return serveDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
+		_ = w.WriteMsg(new(dns.Msg).SetReply(r))
+	})
+}
+
+// loopbackDNS starts a resolver that answers every A question with 127.0.0.1
+// and anything else with an empty reply.
+func loopbackDNS(t *testing.T) string {
+	return serveDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg).SetReply(r)
+		if q := r.Question[0]; q.Qtype == dns.TypeA {
+			m.Answer = []dns.RR{&dns.A{
+				Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+				A:   net.IPv4(127, 0, 0, 1),
+			}}
+		}
+		_ = w.WriteMsg(m)
+	})
+}
+
+func serveDNS(t *testing.T, handler dns.HandlerFunc) string {
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	assert.Nil(t, err)
-	srv := &dns.Server{PacketConn: conn, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
-		_ = w.WriteMsg(new(dns.Msg).SetReply(r))
-	})}
+	srv := &dns.Server{PacketConn: conn, Handler: handler}
 	go func() { _ = srv.ActivateAndServe() }()
 	t.Cleanup(func() { _ = srv.Shutdown() })
 	return conn.LocalAddr().String()
 }
 
-func daemonGet(query url.Values) *httptest.ResponseRecorder {
+// keepResolver restores net.DefaultResolver, which -b replaces, when the test ends.
+func keepResolver(t *testing.T) {
+	resolver := net.DefaultResolver
+	t.Cleanup(func() { net.DefaultResolver = resolver })
+}
+
+// daemonBase is what `q daemon` parses: the flag defaults, applied once.
+func daemonBase(t *testing.T) cli.Flags {
+	opts := newOpts()
+	_, _, err := configure(&opts, []string{"daemon"})
+	assert.NoError(t, err)
+	return opts
+}
+
+func daemonGet(base cli.Flags, query url.Values) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
-	daemonMux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/query?"+query.Encode(), nil))
+	daemonMux(base).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/query?"+query.Encode(), nil))
 	return w
 }
 
 func TestDaemonQueryOpts(t *testing.T) {
-	opts, args, err := queryOpts(url.Values{"name": {"example.com"}, "type": {"TXT,MX", "NS"}, "server": {"@1.1.1.1", "9.9.9.9"}, "timeout": {"3s"}})
+	base := daemonBase(t)
+	base.Server = []string{"8.8.8.8"}
+	base.DNSSEC = true
+	opts, err := queryOpts(base, url.Values{"name": {"example.com"}, "type": {"TXT,MX", "NS"}, "server": {"@1.1.1.1", "9.9.9.9"}, "timeout": {"3s"}})
 	assert.Nil(t, err)
 	assert.Equal(t, "example.com", opts.Name)
 	assert.Equal(t, []string{"TXT", "MX", "NS"}, opts.Types)
 	assert.Equal(t, []string{"1.1.1.1", "9.9.9.9"}, opts.Server)
-	assert.Equal(t, []string{"--format=json", "--timeout=3s"}, args)
+	assert.Equal(t, "json", opts.Format)
+	assert.Equal(t, 3*time.Second, opts.Timeout)
+	assert.True(t, opts.DNSSEC)
+	assert.Equal(t, []string{"8.8.8.8"}, base.Server)
 
-	_, _, err = queryOpts(url.Values{"name": {"-h"}})
+	// A request without a server or types keeps the daemon's
+	opts, err = queryOpts(base, url.Values{"name": {"example.com"}})
+	assert.Nil(t, err)
+	assert.Equal(t, []string{"8.8.8.8"}, opts.Server)
+	assert.Empty(t, opts.Types)
+	assert.Equal(t, 10*time.Second, opts.Timeout)
+
+	_, err = queryOpts(base, url.Values{"name": {"-h"}})
 	assert.NotNil(t, err)
-	_, _, err = queryOpts(url.Values{"name": {"example.com"}, "timeout": {"soon"}})
+	_, err = queryOpts(base, url.Values{"name": {"example.com"}, "timeout": {"soon"}})
 	assert.NotNil(t, err)
 
 	// A type is an RR type, never a CLI option in either boolean notation
 	for _, rrType := range []string{"-V", "+recaxfr", "+not-a-type", "recaxfr=true", "bogus"} {
-		_, _, err = queryOpts(url.Values{"name": {"example.com"}, "type": {rrType}})
+		_, err = queryOpts(base, url.Values{"name": {"example.com"}, "type": {rrType}})
 		assert.NotNil(t, err, rrType)
 	}
 }
@@ -796,7 +842,7 @@ func TestDaemonQueryStaysLiteral(t *testing.T) {
 		{"+abcd", "A", dns.TypeA},
 		{"true", "A", dns.TypeA},
 	} {
-		w := daemonGet(url.Values{"name": {tc.name}, "type": {tc.rrType}, "server": {server}, "timeout": {"2s"}})
+		w := daemonGet(daemonBase(t), url.Values{"name": {tc.name}, "type": {tc.rrType}, "server": {server}, "timeout": {"2s"}})
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 		assert.Contains(t, w.Body.String(), `"question":[{"name":"`+tc.name+`.","qtype":`+strconv.Itoa(int(tc.qtype))+`,"qclass":1}]`)
 	}
@@ -806,7 +852,7 @@ func TestDaemonQueryStaysLiteral(t *testing.T) {
 func TestDaemonDNSCryptFailure(t *testing.T) {
 	// DNSCrypt stamp for 127.0.0.1:1, where nothing listens
 	stamp := "sdns://AQAAAAAAAAAACzEyNy4wLjAuMToxINErR_JS3PLCu_iZEIbq95zkSV2LFsigxDIuUso_OQhzFDIuZG5zY3J5cHQtY2VydC50ZXN0"
-	w := daemonGet(url.Values{"name": {"example.com"}, "type": {"A"}, "server": {stamp}, "timeout": {"1s"}})
+	w := daemonGet(daemonBase(t), url.Values{"name": {"example.com"}, "type": {"A"}, "server": {stamp}, "timeout": {"1s"}})
 	assert.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
 }
 
@@ -825,7 +871,7 @@ func TestDaemonTimeoutCancelsUpstream(t *testing.T) {
 	defer upstream.Close()
 	defer close(release)
 
-	w := daemonGet(url.Values{"name": {"example.com"}, "type": {"A"}, "server": {upstream.URL}, "timeout": {"100ms"}})
+	w := daemonGet(daemonBase(t), url.Values{"name": {"example.com"}, "type": {"A"}, "server": {upstream.URL}, "timeout": {"100ms"}})
 	assert.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
 	assert.Eventually(t, func() bool { return reached.Load() == 1 && active.Load() == 0 }, 2*time.Second, 10*time.Millisecond,
 		"upstream request is still open after the lookup timed out")
@@ -871,7 +917,7 @@ func TestDaemonDoHKeepsDefaultTransport(t *testing.T) {
 	_ = res.Body.Close()
 	before := http.DefaultTransport.(*http.Transport).TLSClientConfig
 
-	w := daemonGet(url.Values{"name": {"example.com"}, "type": {"A"}, "server": {upstream.URL}, "timeout": {"2s"}})
+	w := daemonGet(daemonBase(t), url.Values{"name": {"example.com"}, "type": {"A"}, "server": {upstream.URL}, "timeout": {"2s"}})
 	assert.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
 	assert.Same(t, before, http.DefaultTransport.(*http.Transport).TLSClientConfig)
 }
@@ -915,7 +961,7 @@ func TestDaemonWaitsForShutdown(t *testing.T) {
 	assert.Nil(t, port.Close())
 
 	done := make(chan error, 1)
-	go func() { done <- runDaemon(addr) }()
+	go func() { done <- runDaemon(addr, daemonBase(t)) }()
 	// One connection per request: Shutdown waits 5 seconds for a spare
 	// connection that a client pool opened and never used.
 	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
@@ -948,7 +994,7 @@ func TestDaemonWaitsForShutdown(t *testing.T) {
 }
 
 func TestDaemonConcurrentQueries(t *testing.T) {
-	srv := httptest.NewServer(daemonMux())
+	srv := httptest.NewServer(daemonMux(daemonBase(t)))
 	defer srv.Close()
 
 	var wg sync.WaitGroup
@@ -979,17 +1025,79 @@ func TestDaemonConcurrentQueries(t *testing.T) {
 	}
 }
 
-func TestParseDaemonArgs(t *testing.T) {
-	addr, opts, err := parseDaemonArgs([]string{"127.0.0.1:0", "-b", "127.0.0.1:5353"})
+func TestDaemonCommand(t *testing.T) {
+	keepResolver(t)
+	opts := newOpts()
+	_, daemon, err := configure(&opts, []string{"daemon", "127.0.0.1:0", "-b", "127.0.0.1:5353"})
 	assert.NoError(t, err)
-	assert.Equal(t, "127.0.0.1:0", addr)
+	assert.Equal(t, "127.0.0.1:0", daemon.Args.Addr)
 	assert.Equal(t, "127.0.0.1:5353", opts.BootstrapServer)
 
-	addr, opts, err = parseDaemonArgs([]string{"--bootstrap-server=127.0.0.1:5353"})
+	// The address may follow the flags
+	opts = newOpts()
+	_, daemon, err = configure(&opts, []string{"daemon", "--bootstrap-server=127.0.0.1:5353", "/run/q.sock"})
 	assert.NoError(t, err)
-	assert.Equal(t, defaultDaemonAddr, addr)
-	assert.Equal(t, "127.0.0.1:5353", opts.BootstrapServer)
+	assert.Equal(t, "/run/q.sock", daemon.Args.Addr)
 
-	_, _, err = parseDaemonArgs([]string{"--no-such-flag"})
-	assert.Error(t, err)
+	opts = newOpts()
+	_, daemon, err = configure(&opts, []string{"daemon"})
+	assert.NoError(t, err)
+	assert.Equal(t, defaultDaemonAddr, daemon.Args.Addr)
+
+	opts = newOpts()
+	_, daemon, err = configure(&opts, []string{"example.com", "daemon"})
+	assert.NoError(t, err)
+	assert.Nil(t, daemon)
+
+	for _, args := range [][]string{{"daemon", "--no-such-flag"}, {"daemon", "127.0.0.1:0", "extra"}} {
+		opts = newOpts()
+		_, _, err = configure(&opts, args)
+		assert.Error(t, err, args)
+	}
+}
+
+// A command runs on its own flags: ~/.qrc, the CLI defaults, is not read.
+func TestDaemonIgnoresConfig(t *testing.T) {
+	keepResolver(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	assert.NoError(t, os.WriteFile(filepath.Join(home, ".qrc"), []byte("-b 127.0.0.1:1\n--timeout 4s\n@1.1.1.1\n"), 0o600))
+
+	opts := newOpts()
+	_, daemon, err := configure(&opts, []string{"daemon", "-b", "127.0.0.1:5353"})
+	assert.NoError(t, err)
+	assert.Equal(t, defaultDaemonAddr, daemon.Args.Addr)
+	assert.Equal(t, "127.0.0.1:5353", opts.BootstrapServer)
+	assert.Equal(t, 10*time.Second, opts.Timeout)
+
+	opts = newOpts()
+	args, daemon, err := configure(&opts, []string{"example.com"})
+	assert.NoError(t, err)
+	assert.Nil(t, daemon)
+	assert.Equal(t, 4*time.Second, opts.Timeout)
+	assert.Contains(t, args, "@1.1.1.1")
+}
+
+// The daemon turns a server hostname into an address through the -b resolver
+// given at startup, and the lookup fails when that resolver does not answer.
+func TestDaemonBootstrapResolver(t *testing.T) {
+	keepResolver(t)
+	_, port, err := net.SplitHostPort(localDNS(t))
+	assert.NoError(t, err)
+	request := url.Values{"name": {"example.com"}, "type": {"A"}, "server": {"ns.test:" + port}, "timeout": {"2s"}}
+
+	opts := newOpts()
+	_, daemon, err := configure(&opts, []string{"daemon", "-b", loopbackDNS(t)})
+	assert.NoError(t, err)
+	assert.NotNil(t, daemon)
+	w := daemonGet(opts, request)
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `"replies"`)
+
+	opts = newOpts()
+	_, _, err = configure(&opts, []string{"daemon", "-b", silentUDP(t).LocalAddr().String(), "--bootstrap-timeout=1s"})
+	assert.NoError(t, err)
+	w = daemonGet(opts, request)
+	assert.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "timeout")
 }
