@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/log"
+	"github.com/jessevdk/go-flags"
 
 	"github.com/natesales/q/cli"
 	"github.com/natesales/q/util"
@@ -23,6 +24,32 @@ import (
 // Loopback only: the daemon speaks for whoever can reach it, so it must not
 // be exposed beyond the host it serves.
 const defaultDaemonAddr = "127.0.0.1:8053"
+
+// runDaemonCommand runs `q daemon [addr] [flags]`. A request carries only
+// name, type, server and timeout, so the flags that shape the process, such
+// as the -b bootstrap resolver, are given here and applied once before serving.
+func runDaemonCommand(args []string) error {
+	addr, opts, err := parseDaemonArgs(args)
+	if err != nil {
+		return err
+	}
+	if opts.BootstrapServer != "" {
+		setBootstrapResolver(opts.BootstrapServer, opts.BootstrapTimeout)
+	}
+	return runDaemon(addr)
+}
+
+func parseDaemonArgs(args []string) (string, cli.Flags, error) {
+	addr := defaultDaemonAddr
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		addr, args = args[0], args[1:]
+	}
+	opts := newOpts()
+	parser := flags.NewParser(&opts, flags.Default)
+	parser.Usage = "daemon [addr] [OPTIONS]"
+	_, err := parser.ParseArgs(cli.AddEqualSigns(args))
+	return addr, opts, err
+}
 
 // runDaemon serves DNS queries over HTTP until SIGINT/SIGTERM. addr is a
 // host:port, or a filesystem path for a Unix socket.

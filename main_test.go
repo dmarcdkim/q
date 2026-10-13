@@ -978,3 +978,18 @@ func TestDaemonConcurrentQueries(t *testing.T) {
 		assert.Equal(t, "", r)
 	}
 }
+
+func TestParseDaemonArgs(t *testing.T) {
+	addr, opts, err := parseDaemonArgs([]string{"127.0.0.1:0", "-b", "127.0.0.1:5353"})
+	assert.NoError(t, err)
+	assert.Equal(t, "127.0.0.1:0", addr)
+	assert.Equal(t, "127.0.0.1:5353", opts.BootstrapServer)
+
+	addr, opts, err = parseDaemonArgs([]string{"--bootstrap-server=127.0.0.1:5353"})
+	assert.NoError(t, err)
+	assert.Equal(t, defaultDaemonAddr, addr)
+	assert.Equal(t, "127.0.0.1:5353", opts.BootstrapServer)
+
+	_, _, err = parseDaemonArgs([]string{"--no-such-flag"})
+	assert.Error(t, err)
+}

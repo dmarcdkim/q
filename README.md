@@ -215,7 +215,7 @@ the `SSLKEYLOGFILE` environment variable is set to a file path.
 
 ## Daemon mode
 
-`q daemon [addr]` keeps one process resident and answers the same lookups over HTTP, so a caller that would otherwise fork `q` per query makes a local request instead. `addr` is a loopback `host:port` (default `127.0.0.1:8053`) or a filesystem path for a Unix socket.
+`q daemon [addr] [flags]` keeps one process resident and answers the same lookups over HTTP, so a caller that would otherwise fork `q` per query makes a local request instead. `addr` is a loopback `host:port` (default `127.0.0.1:8053`) or a filesystem path for a Unix socket. A request carries only name, type, server and timeout, so flags that shape the process are given at start: `-b` resolves the server hostnames of every lookup through that bootstrap resolver.
 
 ```bash
 q daemon

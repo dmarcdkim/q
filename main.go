@@ -32,6 +32,22 @@ import (
 
 const defaultServerVar = "Q_DEFAULT_SERVER"
 
+// setBootstrapResolver points the Go resolver, which turns a server hostname
+// into addresses, at server.
+func setBootstrapResolver(server string, timeout time.Duration) {
+	if !regexp.MustCompile(`:\d+$`).MatchString(server) {
+		server += ":53"
+	}
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: timeout}
+			return d.DialContext(ctx, network, server)
+		},
+	}
+	log.Debugf("Using bootstrap resolver %s", server)
+}
+
 // Build process flags
 var (
 	version = "dev"
@@ -287,23 +303,8 @@ All long form (--) flags can be toggled with the dig-standard +[no]flag notation
 		opts.ShowStats = true
 	}
 
-	// Set bootstrap resolver
 	if opts.BootstrapServer != "" {
-		// Add port if not specified
-		rePortSuffix := regexp.MustCompile(`:\d+$`)
-		if !rePortSuffix.MatchString(opts.BootstrapServer) {
-			opts.BootstrapServer += ":53"
-		}
-
-		net.DefaultResolver = &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				d := net.Dialer{Timeout: opts.BootstrapTimeout}
-				return d.DialContext(ctx, network, opts.BootstrapServer)
-			},
-		}
-
-		log.Debugf("Using bootstrap resolver %s", opts.BootstrapServer)
+		setBootstrapResolver(opts.BootstrapServer, opts.BootstrapTimeout)
 	}
 
 	// Parse requested RR types
@@ -691,11 +692,7 @@ All long form (--) flags can be toggled with the dig-standard +[no]flag notation
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "daemon" {
-		addr := defaultDaemonAddr
-		if len(os.Args) > 2 {
-			addr = os.Args[2]
-		}
-		if err := runDaemon(addr); err != nil {
+		if err := runDaemonCommand(os.Args[2:]); err != nil {
 			log.Fatal(err)
 		}
 		return
