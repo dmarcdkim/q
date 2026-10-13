@@ -24,20 +24,13 @@ import (
 // be exposed beyond the host it serves.
 const defaultDaemonAddr = "127.0.0.1:8053"
 
-const (
-	daemonShort = "Serve lookups over HTTP"
-	daemonLong  = "Serve lookups over HTTP on addr, a loopback host:port or a Unix socket path. " +
-		"The other flags are read once and apply to every lookup; a request overrides name, type, server and timeout. ~/.qrc is not read."
-)
-
-// daemonCommand is `q daemon [addr]`. A request carries only name, type,
-// server and timeout, so the flags that shape the process, such as the -b
-// bootstrap resolver, are given on the command line and applied once before
-// serving; the parsed flags are the base of every request.
-type daemonCommand struct {
-	Args struct {
-		Addr string `positional-arg-name:"addr" description:"host:port or Unix socket path (default 127.0.0.1:8053)"`
-	} `positional-args:"yes"`
+// daemonAddr is the listen address: the one positional of `q -D [addr]`, else
+// the default.
+func daemonAddr(rest []string) string {
+	if len(rest) > 0 {
+		return rest[0]
+	}
+	return defaultDaemonAddr
 }
 
 // runDaemon serves DNS queries over HTTP until SIGINT/SIGTERM. addr is a
@@ -128,15 +121,18 @@ func queryHandler(base cli.Flags, w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(buf.Bytes())
 }
 
-// queryOpts lays a request over the base flags. name, type and server are set
-// on the flags directly, never parsed as arguments, so a value can neither be
-// read as an option nor infer a different target. Slices are replaced, never
-// appended to, so concurrent requests share nothing with base.
+// queryOpts lays a request over the base flags: name, type, server and timeout
+// fall back to the flags the daemon started with. They are set on the flags
+// directly, never parsed as arguments, so a value can neither be read as an
+// option nor infer a different target. Slices are replaced, never appended to,
+// so concurrent requests share nothing with base.
 func queryOpts(base cli.Flags, query url.Values) (cli.Flags, error) {
 	opts := base
 	opts.Format = "json"
 
-	opts.Name = query.Get("name")
+	if name := query.Get("name"); name != "" {
+		opts.Name = name
+	}
 	if opts.Name == "" || strings.HasPrefix(opts.Name, "-") || strings.ContainsAny(opts.Name, " \t@/") {
 		return opts, fmt.Errorf("name parameter is required and must be a DNS name")
 	}
@@ -147,10 +143,10 @@ func queryOpts(base cli.Flags, query url.Values) (cli.Flags, error) {
 		return opts, err
 	}
 	if servers := splitList(query["server"]); len(servers) > 0 {
-		opts.Server = nil
-		for _, server := range servers {
-			opts.Server = append(opts.Server, strings.TrimPrefix(server, "@"))
+		for i, server := range servers {
+			servers[i] = strings.TrimPrefix(server, "@")
 		}
+		opts.Server = servers
 	}
 	if timeout := query.Get("timeout"); timeout != "" {
 		d, err := time.ParseDuration(timeout)

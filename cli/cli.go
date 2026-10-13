@@ -33,6 +33,7 @@ type Flags struct {
 	ID               int           `long:"qid" description:"Set query ID (-1 for random)" default:"-1"`
 	BootstrapServer  string        `short:"b" long:"bootstrap-server" description:"DNS server to use for bootstrapping"`
 	BootstrapTimeout time.Duration `long:"bootstrap-timeout" description:"Bootstrapping timeout" default:"5s"`
+	Daemon           bool          `short:"D" long:"daemon" description:"Serve lookups over HTTP on the positional address (default 127.0.0.1:8053); must be the first argument"`
 	Cookie           string        `long:"cookie" description:"EDNS0 cookie"`
 
 	// Special query modes
@@ -267,7 +268,7 @@ func AddEqualSigns(args []string) []string {
 						newArgs = append(newArgs, arg)
 						continue
 					}
-					
+
 					// If the next argument is a value (not a flag), combine them
 					if len(nextArg) == 0 || nextArg[0] != '-' {
 						newArgs = append(newArgs, arg+"="+nextArg)

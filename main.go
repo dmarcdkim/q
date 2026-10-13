@@ -264,7 +264,7 @@ func loadConfig() []string {
 
 // driver is the "main" function for this program that accepts a flag slice for testing
 func driver(opts *cli.Flags, args []string, out io.Writer) error {
-	args, daemon, err := configure(opts, args)
+	rest, err := configure(opts, args)
 	if err != nil {
 		return err
 	}
@@ -274,44 +274,56 @@ func driver(opts *cli.Flags, args []string, out io.Writer) error {
 		return nil
 	}
 
-	if daemon != nil {
-		return runDaemon(daemon.Args.Addr, *opts)
+	if opts.Daemon {
+		return runDaemon(daemonAddr(rest), *opts)
 	}
-	return query(opts, args, out)
+	return query(opts, rest, out)
 }
 
-// configure reads ~/.qrc and args into opts and applies the flags that shape
-// the process: color, log level and the bootstrap resolver. It returns the
-// processed args and the daemon command when args select it.
-func configure(opts *cli.Flags, args []string) ([]string, *daemonCommand, error) {
-	parser := flags.NewParser(opts, flags.Default)
-	parser.Usage = "[OPTIONS] [@server] [type...] [name]"
-	parser.LongDescription = "All long form (--) flags can be toggled with the dig-standard +[no]flag notation."
-	parser.SubcommandsOptional = true
-	daemon := &daemonCommand{}
-	daemon.Args.Addr = defaultDaemonAddr
-	daemonCmd, err := parser.AddCommand("daemon", daemonShort, daemonLong, daemon)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// ~/.qrc holds a user's CLI defaults, options and positionals alike. A
-	// command runs a service on the flags it was started with, and nothing else.
-	if len(args) == 0 || parser.Find(args[0]) == nil {
+// configure reads the flags once and applies the ones that shape the process:
+// color, log level and the bootstrap resolver. It returns the positionals.
+//
+// ~/.qrc holds a user's CLI defaults, options and positionals alike. A service
+// runs on the flags it was started with and nothing else, so -D leads the
+// arguments or is absent, and the config joins the CLI path only.
+func configure(opts *cli.Flags, args []string) ([]string, error) {
+	daemon := len(args) > 0 && isDaemonFlag(args[0])
+	if !daemon {
 		args = append(loadConfig(), args...)
 	}
 	args = cli.SetFalseBooleans(opts, args)
 	args = cli.AddEqualSigns(args)
+	args, plus := splitPlusFlags(args)
+
+	parser := flags.NewParser(opts, flags.Default)
+	parser.Usage = "[OPTIONS] [@server] [type...] [name]"
+	parser.LongDescription = "All long form (--) flags can be toggled with the dig-standard +[no]flag notation. " +
+		"q -D [addr] [OPTIONS] serves lookups over HTTP instead of running one; see --daemon."
 	rest, err := parser.ParseArgs(args)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	if parser.Active != daemonCmd {
-		daemon = nil
-	} else if len(rest) > 0 {
-		return nil, nil, fmt.Errorf("daemon: unexpected argument %q", rest[0])
+	cli.ParsePlusFlags(opts, plus)
+
+	if opts.Daemon != daemon {
+		return nil, fmt.Errorf("-D/--daemon must be the first argument")
 	}
-	cli.ParsePlusFlags(opts, args)
+	if opts.Daemon {
+		if len(rest) > 1 {
+			return nil, fmt.Errorf("daemon: unexpected argument %q", rest[1])
+		}
+		// Both print for a terminal instead of answering the lookup, and a
+		// failed transfer exits the process.
+		if opts.RecAXFR || opts.NSIDOnly {
+			return nil, fmt.Errorf("daemon: --recaxfr and --nsid-only are CLI-only")
+		}
+	}
+	if opts.ClientSubnet != "" {
+		if _, _, err := net.ParseCIDR(opts.ClientSubnet); err != nil {
+			return nil, fmt.Errorf("invalid subnet %q", opts.ClientSubnet)
+		}
+	}
+
 	if util.UseColor != opts.Color {
 		util.UseColor = opts.Color
 	}
@@ -336,7 +348,29 @@ func configure(opts *cli.Flags, args []string) ([]string, *daemonCommand, error)
 	if opts.BootstrapServer != "" {
 		setBootstrapResolver(opts.BootstrapServer, opts.BootstrapTimeout)
 	}
-	return args, daemon, nil
+	return rest, nil
+}
+
+// isDaemonFlag reports whether arg is -D in one of its spellings.
+func isDaemonFlag(arg string) bool {
+	switch strings.TrimSuffix(arg, "=true") {
+	case "-D", "--daemon", "+daemon":
+		return true
+	}
+	return false
+}
+
+// splitPlusFlags separates the dig-style +[no]flag tokens, which go-flags
+// would take for positionals, from the rest of args.
+func splitPlusFlags(args []string) (rest, plus []string) {
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "+") {
+			plus = append(plus, arg)
+		} else {
+			rest = append(rest, arg)
+		}
+	}
+	return rest, plus
 }
 
 // query runs one lookup with opts, already configured, and writes the result to out.
