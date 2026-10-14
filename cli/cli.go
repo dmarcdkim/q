@@ -172,18 +172,13 @@ func SetFalseBooleans(opts *Flags, args []string) []string {
 
 	var remainingArgs []string
 	for _, arg := range args {
-		state := strings.HasSuffix(arg, "=true")
-		if !state && !strings.HasSuffix(arg, "=false") {
-			remainingArgs = append(remainingArgs, arg)
+		name, value, _ := strings.Cut(strings.TrimLeft(arg, "-"), "=")
+		if (value == "true" || value == "false") && setBool(opts, name, value == "true") {
 			continue
 		}
-		name := strings.TrimLeft(arg, "-")
-		name = name[:strings.LastIndex(name, "=")]
-		if !setBool(opts, name, state) {
-			// Not a boolean of ours: go-flags reports an unknown flag, or
-			// takes the value for the flag that does want one.
-			remainingArgs = append(remainingArgs, arg)
-		}
+		// Not a boolean of ours: go-flags reports an unknown flag, or
+		// takes the value for the flag that does want one.
+		remainingArgs = append(remainingArgs, arg)
 	}
 	return remainingArgs
 }
