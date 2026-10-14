@@ -32,6 +32,22 @@ import (
 
 const defaultServerVar = "Q_DEFAULT_SERVER"
 
+// setBootstrapResolver points the Go resolver, which turns a server hostname
+// into addresses, at server.
+func setBootstrapResolver(server string, timeout time.Duration) {
+	if !regexp.MustCompile(`:\d+$`).MatchString(server) {
+		server += ":53"
+	}
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: timeout}
+			return d.DialContext(ctx, network, server)
+		},
+	}
+	log.Debugf("Using bootstrap resolver %s", server)
+}
+
 // Build process flags
 var (
 	version = "dev"
@@ -248,19 +264,73 @@ func loadConfig() []string {
 
 // driver is the "main" function for this program that accepts a flag slice for testing
 func driver(opts *cli.Flags, args []string, out io.Writer) error {
-	configArgs := loadConfig()
-	args = append(configArgs, args...)
-	args = cli.SetFalseBooleans(opts, args)
-	args = cli.AddEqualSigns(args)
-	parser := flags.NewParser(opts, flags.Default)
-	parser.Usage = `[OPTIONS] [@server] [type...] [name]
-
-All long form (--) flags can be toggled with the dig-standard +[no]flag notation.`
-	_, err := parser.ParseArgs(args)
+	rest, err := configure(opts, args)
 	if err != nil {
 		return err
 	}
-	cli.ParsePlusFlags(opts, args)
+
+	if opts.ShowVersion {
+		util.MustWritef(out, "https://github.com/natesales/q version %s (%s %s)\n", version, commit, date)
+		return nil
+	}
+
+	if opts.Daemon != "" {
+		return runDaemon(opts.Daemon, *opts)
+	}
+	return query(opts, rest, out)
+}
+
+// configure reads the flags once and applies the ones that shape the process:
+// color, log level and the bootstrap resolver. It returns the positionals.
+//
+// ~/.qrc holds a user's CLI defaults, options and positionals alike. A service
+// runs on the flags it was started with and nothing else, so -D leads the
+// arguments or is absent, and the config joins the CLI path only.
+func configure(opts *cli.Flags, args []string) ([]string, error) {
+	daemon := len(args) > 0 && isDaemonFlag(args[0])
+	if !daemon {
+		args = append(loadConfig(), args...)
+	}
+	args = cli.SetFalseBooleans(opts, args)
+	args = cli.AddEqualSigns(args)
+
+	parser := flags.NewParser(opts, flags.Default)
+	parser.Usage = "[OPTIONS] [@server] [type...] [name]"
+	parser.LongDescription = "All long form (--) flags can be toggled with the dig-standard +[no]flag notation. " +
+		"q -D ADDR [OPTIONS] serves lookups over HTTP instead of running one; see --daemon."
+	rest, err := parser.ParseArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	rest, plus := splitPlusFlags(rest)
+	cli.ParsePlusFlags(opts, plus)
+
+	if parser.FindOptionByLongName("daemon").IsSet() != daemon {
+		return nil, fmt.Errorf("-D/--daemon must be the first argument")
+	}
+	if daemon {
+		if opts.Daemon == "" {
+			return nil, fmt.Errorf("daemon: empty address")
+		}
+		if len(rest) > 0 {
+			return nil, fmt.Errorf("daemon: unexpected argument %q", rest[0])
+		}
+		// Both print for a terminal instead of answering the lookup, and a
+		// failed transfer exits the process.
+		if opts.RecAXFR || opts.NSIDOnly {
+			return nil, fmt.Errorf("daemon: --recaxfr and --nsid-only are CLI-only")
+		}
+	}
+	// The positional form is @server; a -s value may carry the @ too.
+	for i, server := range opts.Server {
+		opts.Server[i] = strings.TrimPrefix(server, "@")
+	}
+	if opts.ClientSubnet != "" {
+		if _, _, err := net.ParseCIDR(opts.ClientSubnet); err != nil {
+			return nil, fmt.Errorf("invalid subnet %q", opts.ClientSubnet)
+		}
+	}
+
 	if util.UseColor != opts.Color {
 		util.UseColor = opts.Color
 	}
@@ -274,11 +344,6 @@ All long form (--) flags can be toggled with the dig-standard +[no]flag notation
 		opts.ShowAll = true
 	}
 
-	if opts.ShowVersion {
-		util.MustWritef(out, "https://github.com/natesales/q version %s (%s %s)\n", version, commit, date)
-		return nil
-	}
-
 	if opts.ShowAll {
 		opts.ShowQuestion = true
 		opts.ShowAnswer = true
@@ -287,25 +352,33 @@ All long form (--) flags can be toggled with the dig-standard +[no]flag notation
 		opts.ShowStats = true
 	}
 
-	// Set bootstrap resolver
 	if opts.BootstrapServer != "" {
-		// Add port if not specified
-		rePortSuffix := regexp.MustCompile(`:\d+$`)
-		if !rePortSuffix.MatchString(opts.BootstrapServer) {
-			opts.BootstrapServer += ":53"
-		}
-
-		net.DefaultResolver = &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				d := net.Dialer{Timeout: opts.BootstrapTimeout}
-				return d.DialContext(ctx, network, opts.BootstrapServer)
-			},
-		}
-
-		log.Debugf("Using bootstrap resolver %s", opts.BootstrapServer)
+		setBootstrapResolver(opts.BootstrapServer, opts.BootstrapTimeout)
 	}
+	return rest, nil
+}
 
+// isDaemonFlag reports whether arg is -D in one of go-flags' spellings:
+// -D, -DADDR, --daemon, --daemon=ADDR.
+func isDaemonFlag(arg string) bool {
+	return arg == "--daemon" || strings.HasPrefix(arg, "--daemon=") || strings.HasPrefix(arg, "-D")
+}
+
+// splitPlusFlags separates the dig-style +[no]flag tokens, which go-flags
+// would take for positionals, from the rest of args.
+func splitPlusFlags(args []string) (rest, plus []string) {
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "+") {
+			plus = append(plus, arg)
+		} else {
+			rest = append(rest, arg)
+		}
+	}
+	return rest, plus
+}
+
+// query runs one lookup with opts, already configured, and writes the result to out.
+func query(opts *cli.Flags, args []string, out io.Writer) error {
 	// Parse requested RR types
 	rrTypes, err := cli.ParseRRTypes(opts.Types)
 	if err != nil {
@@ -328,10 +401,6 @@ All long form (--) flags can be toggled with the dig-standard +[no]flag notation
 		rrType, typeFound := dns.StringToType[strings.ToUpper(arg)]
 		if typeFound {
 			rrTypes[rrType] = true
-			if rrType == dns.TypeNS {
-				opts.ShowAuthority = true
-				opts.ShowAdditional = true
-			}
 		}
 
 		// Set qname if not set by flag
@@ -342,6 +411,12 @@ All long form (--) flags can be toggled with the dig-standard +[no]flag notation
 			!strings.HasPrefix(arg, "-") { // Not a flag
 			opts.Name = arg
 		}
+	}
+
+	// A referral answers NS in the authority and additional sections
+	if rrTypes[dns.TypeNS] {
+		opts.ShowAuthority = true
+		opts.ShowAdditional = true
 	}
 
 	// Registry lookup (RDAP / port-43 WHOIS)
@@ -690,17 +765,6 @@ All long form (--) flags can be toggled with the dig-standard +[no]flag notation
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "daemon" {
-		addr := defaultDaemonAddr
-		if len(os.Args) > 2 {
-			addr = os.Args[2]
-		}
-		if err := runDaemon(addr); err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
-
 	opts := newOpts()
 	if err := driver(&opts, os.Args[1:], os.Stdout); err != nil {
 		// go-flags has already printed the usage text

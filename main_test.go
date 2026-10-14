@@ -712,7 +712,7 @@ func TestMainMultipleServersAllFail(t *testing.T) {
 }
 
 func TestDaemonQuery(t *testing.T) {
-	srv := httptest.NewServer(daemonMux())
+	srv := httptest.NewServer(daemonMux(daemonBase(t)))
 	defer srv.Close()
 
 	res, err := http.Get(srv.URL + "/query?name=example.com&type=A&server=9.9.9.9&timeout=5s")
@@ -745,38 +745,92 @@ func silentUDP(t *testing.T) net.PacketConn {
 
 // localDNS starts a loopback DNS server that answers every query with an empty reply.
 func localDNS(t *testing.T) string {
+	return serveDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
+		_ = w.WriteMsg(new(dns.Msg).SetReply(r))
+	})
+}
+
+// loopbackDNS starts a resolver that answers every A question with 127.0.0.1
+// and anything else with an empty reply.
+func loopbackDNS(t *testing.T) string {
+	return serveDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg).SetReply(r)
+		if q := r.Question[0]; q.Qtype == dns.TypeA {
+			m.Answer = []dns.RR{&dns.A{
+				Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+				A:   net.IPv4(127, 0, 0, 1),
+			}}
+		}
+		_ = w.WriteMsg(m)
+	})
+}
+
+func serveDNS(t *testing.T, handler dns.HandlerFunc) string {
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	assert.Nil(t, err)
-	srv := &dns.Server{PacketConn: conn, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
-		_ = w.WriteMsg(new(dns.Msg).SetReply(r))
-	})}
+	srv := &dns.Server{PacketConn: conn, Handler: handler}
 	go func() { _ = srv.ActivateAndServe() }()
 	t.Cleanup(func() { _ = srv.Shutdown() })
 	return conn.LocalAddr().String()
 }
 
-func daemonGet(query url.Values) *httptest.ResponseRecorder {
+// keepResolver restores net.DefaultResolver, which -b replaces, when the test ends.
+func keepResolver(t *testing.T) {
+	resolver := net.DefaultResolver
+	t.Cleanup(func() { net.DefaultResolver = resolver })
+}
+
+// daemonBase is what `q -D` parses: the flag defaults, applied once.
+func daemonBase(t *testing.T) cli.Flags {
+	opts := newOpts()
+	_, err := configure(&opts, []string{"-D", "127.0.0.1:0"})
+	assert.NoError(t, err)
+	return opts
+}
+
+func daemonGet(base cli.Flags, query url.Values) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
-	daemonMux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/query?"+query.Encode(), nil))
+	daemonMux(base).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/query?"+query.Encode(), nil))
 	return w
 }
 
 func TestDaemonQueryOpts(t *testing.T) {
-	opts, args, err := queryOpts(url.Values{"name": {"example.com"}, "type": {"TXT,MX", "NS"}, "server": {"@1.1.1.1", "9.9.9.9"}, "timeout": {"3s"}})
+	base := daemonBase(t)
+	base.Server = []string{"8.8.8.8"}
+	base.DNSSEC = true
+	opts, err := queryOpts(base, url.Values{"name": {"example.com"}, "type": {"TXT,MX", "NS"}, "server": {"@1.1.1.1", "9.9.9.9"}, "timeout": {"3s"}})
 	assert.Nil(t, err)
 	assert.Equal(t, "example.com", opts.Name)
 	assert.Equal(t, []string{"TXT", "MX", "NS"}, opts.Types)
 	assert.Equal(t, []string{"1.1.1.1", "9.9.9.9"}, opts.Server)
-	assert.Equal(t, []string{"--format=json", "--timeout=3s"}, args)
+	assert.Equal(t, "json", opts.Format)
+	assert.Equal(t, 3*time.Second, opts.Timeout)
+	assert.True(t, opts.DNSSEC)
+	assert.Equal(t, []string{"8.8.8.8"}, base.Server)
 
-	_, _, err = queryOpts(url.Values{"name": {"-h"}})
+	// A request without a server or types keeps the daemon's
+	opts, err = queryOpts(base, url.Values{"name": {"example.com"}})
+	assert.Nil(t, err)
+	assert.Equal(t, []string{"8.8.8.8"}, opts.Server)
+	assert.Empty(t, opts.Types)
+	assert.Equal(t, 10*time.Second, opts.Timeout)
+
+	_, err = queryOpts(base, url.Values{"name": {"-h"}})
 	assert.NotNil(t, err)
-	_, _, err = queryOpts(url.Values{"name": {"example.com"}, "timeout": {"soon"}})
+
+	// name falls back to the startup --qname and is required without one
+	_, err = queryOpts(base, url.Values{})
+	assert.NotNil(t, err)
+	base.Name = "default.test"
+	opts, err = queryOpts(base, url.Values{})
+	assert.Nil(t, err)
+	assert.Equal(t, "default.test", opts.Name)
+	_, err = queryOpts(base, url.Values{"name": {"example.com"}, "timeout": {"soon"}})
 	assert.NotNil(t, err)
 
 	// A type is an RR type, never a CLI option in either boolean notation
 	for _, rrType := range []string{"-V", "+recaxfr", "+not-a-type", "recaxfr=true", "bogus"} {
-		_, _, err = queryOpts(url.Values{"name": {"example.com"}, "type": {rrType}})
+		_, err = queryOpts(base, url.Values{"name": {"example.com"}, "type": {rrType}})
 		assert.NotNil(t, err, rrType)
 	}
 }
@@ -796,7 +850,7 @@ func TestDaemonQueryStaysLiteral(t *testing.T) {
 		{"+abcd", "A", dns.TypeA},
 		{"true", "A", dns.TypeA},
 	} {
-		w := daemonGet(url.Values{"name": {tc.name}, "type": {tc.rrType}, "server": {server}, "timeout": {"2s"}})
+		w := daemonGet(daemonBase(t), url.Values{"name": {tc.name}, "type": {tc.rrType}, "server": {server}, "timeout": {"2s"}})
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 		assert.Contains(t, w.Body.String(), `"question":[{"name":"`+tc.name+`.","qtype":`+strconv.Itoa(int(tc.qtype))+`,"qclass":1}]`)
 	}
@@ -806,7 +860,7 @@ func TestDaemonQueryStaysLiteral(t *testing.T) {
 func TestDaemonDNSCryptFailure(t *testing.T) {
 	// DNSCrypt stamp for 127.0.0.1:1, where nothing listens
 	stamp := "sdns://AQAAAAAAAAAACzEyNy4wLjAuMToxINErR_JS3PLCu_iZEIbq95zkSV2LFsigxDIuUso_OQhzFDIuZG5zY3J5cHQtY2VydC50ZXN0"
-	w := daemonGet(url.Values{"name": {"example.com"}, "type": {"A"}, "server": {stamp}, "timeout": {"1s"}})
+	w := daemonGet(daemonBase(t), url.Values{"name": {"example.com"}, "type": {"A"}, "server": {stamp}, "timeout": {"1s"}})
 	assert.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
 }
 
@@ -825,7 +879,7 @@ func TestDaemonTimeoutCancelsUpstream(t *testing.T) {
 	defer upstream.Close()
 	defer close(release)
 
-	w := daemonGet(url.Values{"name": {"example.com"}, "type": {"A"}, "server": {upstream.URL}, "timeout": {"100ms"}})
+	w := daemonGet(daemonBase(t), url.Values{"name": {"example.com"}, "type": {"A"}, "server": {upstream.URL}, "timeout": {"100ms"}})
 	assert.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
 	assert.Eventually(t, func() bool { return reached.Load() == 1 && active.Load() == 0 }, 2*time.Second, 10*time.Millisecond,
 		"upstream request is still open after the lookup timed out")
@@ -871,7 +925,7 @@ func TestDaemonDoHKeepsDefaultTransport(t *testing.T) {
 	_ = res.Body.Close()
 	before := http.DefaultTransport.(*http.Transport).TLSClientConfig
 
-	w := daemonGet(url.Values{"name": {"example.com"}, "type": {"A"}, "server": {upstream.URL}, "timeout": {"2s"}})
+	w := daemonGet(daemonBase(t), url.Values{"name": {"example.com"}, "type": {"A"}, "server": {upstream.URL}, "timeout": {"2s"}})
 	assert.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
 	assert.Same(t, before, http.DefaultTransport.(*http.Transport).TLSClientConfig)
 }
@@ -915,7 +969,7 @@ func TestDaemonWaitsForShutdown(t *testing.T) {
 	assert.Nil(t, port.Close())
 
 	done := make(chan error, 1)
-	go func() { done <- runDaemon(addr) }()
+	go func() { done <- runDaemon(addr, daemonBase(t)) }()
 	// One connection per request: Shutdown waits 5 seconds for a spare
 	// connection that a client pool opened and never used.
 	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
@@ -948,7 +1002,7 @@ func TestDaemonWaitsForShutdown(t *testing.T) {
 }
 
 func TestDaemonConcurrentQueries(t *testing.T) {
-	srv := httptest.NewServer(daemonMux())
+	srv := httptest.NewServer(daemonMux(daemonBase(t)))
 	defer srv.Close()
 
 	var wg sync.WaitGroup
@@ -977,4 +1031,208 @@ func TestDaemonConcurrentQueries(t *testing.T) {
 	for r := range results {
 		assert.Equal(t, "", r)
 	}
+}
+
+// -D leads the arguments; the one positional is the listen address.
+func TestDaemonFlag(t *testing.T) {
+	keepResolver(t)
+	opts := newOpts()
+	rest, err := configure(&opts, []string{"-D", "127.0.0.1:0", "-b", "127.0.0.1:5353", "+noedns"})
+	assert.NoError(t, err)
+	assert.Empty(t, rest)
+	assert.Equal(t, "127.0.0.1:0", opts.Daemon)
+	assert.Equal(t, "127.0.0.1:5353", opts.BootstrapServer)
+	assert.False(t, opts.EDNS)
+
+	// The address binds to the flag in each of go-flags' spellings
+	for _, args := range [][]string{
+		{"--daemon", "/run/q.sock", "--bootstrap-server=127.0.0.1:5353"}, {"--daemon=/run/q.sock", "+noedns"}, {"-D/run/q.sock"},
+	} {
+		opts = newOpts()
+		_, err = configure(&opts, args)
+		assert.NoError(t, err, args)
+		assert.Equal(t, "/run/q.sock", opts.Daemon, args)
+	}
+
+	// Anywhere else -D is an error, as are a missing or empty address, a
+	// positional, an unknown flag, and the flags that cannot serve a lookup.
+	for _, args := range [][]string{
+		{"-v", "-D", "127.0.0.1:0"}, {"example.com", "--daemon=127.0.0.1:0"}, {"-b", "127.0.0.1:5353", "-D", "127.0.0.1:0"}, {"A", "--daemon", "127.0.0.1:0"},
+		{"-D"}, {"-D", "-b", "127.0.0.1:5353"}, {"-D="}, {"--daemon="}, {"example.com", "-D="}, {"example.com", "--daemon="}, {"-D", "127.0.0.1:0", "extra"}, {"-D", "127.0.0.1:0", "--no-such-flag"},
+		{"-D", "127.0.0.1:0", "--recaxfr"}, {"-D", "127.0.0.1:0", "--nsid-only"}, {"-D", "127.0.0.1:0", "-N=true"}, {"-D", "127.0.0.1:0", "--subnet=bogus"},
+	} {
+		opts = newOpts()
+		_, err = configure(&opts, args)
+		assert.Error(t, err, args)
+	}
+}
+
+// query gets the positionals go-flags leaves, so a short flag's value is
+// neither a name nor a type, and the +[no]flag tokens are neither.
+func TestConfigurePositionals(t *testing.T) {
+	keepResolver(t)
+	opts := newOpts()
+	rest, err := configure(&opts, []string{"-b", "127.0.0.1:5353", "+noedns", "A", "example.com", "--timeout", "3s"})
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"A", "example.com"}, rest)
+	assert.Equal(t, "127.0.0.1:5353", opts.BootstrapServer)
+	assert.Equal(t, 3*time.Second, opts.Timeout)
+	assert.False(t, opts.EDNS)
+	assert.Empty(t, opts.Daemon)
+}
+
+// A service runs on its own flags: ~/.qrc, the CLI defaults, is not read, and
+// cannot turn a lookup into a service.
+func TestDaemonIgnoresConfig(t *testing.T) {
+	keepResolver(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	config := filepath.Join(home, ".qrc")
+	assert.NoError(t, os.WriteFile(config, []byte("-b 127.0.0.1:1\n--timeout 4s\n@1.1.1.1\n"), 0o600))
+
+	opts := newOpts()
+	rest, err := configure(&opts, []string{"-D", "127.0.0.1:0", "-b", "127.0.0.1:5353"})
+	assert.NoError(t, err)
+	assert.Empty(t, rest)
+	assert.Equal(t, "127.0.0.1:0", opts.Daemon)
+	assert.Equal(t, "127.0.0.1:5353", opts.BootstrapServer)
+	assert.Equal(t, 10*time.Second, opts.Timeout)
+
+	opts = newOpts()
+	rest, err = configure(&opts, []string{"example.com"})
+	assert.NoError(t, err)
+	assert.Empty(t, opts.Daemon)
+	assert.Equal(t, 4*time.Second, opts.Timeout)
+	assert.Equal(t, []string{"@1.1.1.1", "example.com"}, rest)
+
+	assert.NoError(t, os.WriteFile(config, []byte("--daemon=127.0.0.1:0\n"), 0o600))
+	opts = newOpts()
+	_, err = configure(&opts, []string{"example.com"})
+	assert.Error(t, err)
+}
+
+// The daemon turns a server hostname into an address through the -b resolver
+// given at startup, and the lookup fails when that resolver cannot resolve it.
+func TestDaemonBootstrapResolver(t *testing.T) {
+	keepResolver(t)
+	_, port, err := net.SplitHostPort(localDNS(t))
+	assert.NoError(t, err)
+	request := url.Values{"name": {"example.com"}, "type": {"A"}, "server": {"ns.test:" + port}, "timeout": {"2s"}}
+
+	opts := newOpts()
+	_, err = configure(&opts, []string{"-D", "127.0.0.1:0", "-b", loopbackDNS(t)})
+	assert.NoError(t, err)
+	assert.Equal(t, "127.0.0.1:0", opts.Daemon)
+	w := daemonGet(opts, request)
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `"replies"`)
+
+	// A refusing resolver fails the lookup at once, so no lookup worker outlives
+	// the request and races the cleanup that restores net.DefaultResolver.
+	refusing := serveDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
+		_ = w.WriteMsg(new(dns.Msg).SetRcode(r, dns.RcodeRefused))
+	})
+	opts = newOpts()
+	_, err = configure(&opts, []string{"-D", "127.0.0.1:0", "-b", refusing})
+	assert.NoError(t, err)
+	w = daemonGet(opts, request)
+	assert.Equal(t, http.StatusBadGateway, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "ns.test")
+}
+
+// driver starts the service on -D with the flags as the defaults of every
+// lookup, and returns once SIGTERM has drained it.
+func TestDriverServesDaemon(t *testing.T) {
+	upstream := loopbackDNS(t)
+	port, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.Nil(t, err)
+	addr := port.Addr().String()
+	assert.Nil(t, port.Close())
+
+	opts := newOpts()
+	done := make(chan error, 1)
+	go func() { done <- driver(&opts, []string{"-D", addr, "--server", upstream}, io.Discard) }()
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	assert.Eventually(t, func() bool {
+		res, err := client.Get("http://" + addr + "/health")
+		if err != nil {
+			return false
+		}
+		_ = res.Body.Close()
+		return res.StatusCode == http.StatusOK
+	}, 5*time.Second, 20*time.Millisecond)
+
+	res, err := client.Get("http://" + addr + "/query?name=example.com&type=A")
+	assert.Nil(t, err)
+	body, _ := io.ReadAll(res.Body)
+	_ = res.Body.Close()
+	assert.Equal(t, http.StatusOK, res.StatusCode, string(body))
+	assert.Contains(t, string(body), `"server":"`+upstream+`"`)
+	assert.Contains(t, string(body), `"replies"`)
+
+	self, err := os.FindProcess(os.Getpid())
+	assert.Nil(t, err)
+	assert.Nil(t, self.Signal(syscall.SIGTERM))
+	assert.Nil(t, <-done)
+}
+
+// The NS type asks for the referral sections however it is given.
+func TestNSFlagReferral(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	server := serveDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg).SetReply(r)
+		m.Ns = []dns.RR{&dns.NS{
+			Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 60},
+			Ns:  "ns.example.com.",
+		}}
+		_ = w.WriteMsg(m)
+	})
+	for _, args := range [][]string{{"-t", "NS", "example.com"}, {"NS", "example.com"}} {
+		out, err := run(append(args, "--server="+server, "--format=raw")...)
+		assert.NoError(t, err, args)
+		assert.Contains(t, out.String(), "ns.example.com.", args)
+	}
+}
+
+// A true or false value of a flag that is not a boolean stays its value.
+func TestNonbooleanFlagValues(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	opts := newOpts()
+	_, err := configure(&opts, []string{"-q", "true", "--http-header=X-Flag: value=true"})
+	assert.NoError(t, err)
+	assert.Equal(t, "true", opts.Name)
+	assert.Equal(t, []string{"X-Flag: value=true"}, opts.HTTPHeaders)
+}
+
+// A server given to -s or --server may carry the @ of the positional form.
+func TestSeparatedServerPrefix(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	server := localDNS(t)
+	for _, flag := range []string{"-s", "--server"} {
+		opts := newOpts()
+		args := []string{flag, "@" + server, "-t", "A", "example.com", "--timeout=1s"}
+		assert.NoError(t, driver(&opts, args, io.Discard), args)
+		assert.Equal(t, []string{server}, opts.Server, args)
+	}
+}
+
+// A short flag's value may begin with +: it is the flag's, not a +[no]flag.
+func TestLiteralPlusValues(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	server := localDNS(t)
+	for _, args := range [][]string{{"-q", "+edns", "--type=A"}, {"-t", "+1", "--qname=example.com"}} {
+		opts := newOpts()
+		args = append(args, "--server="+server, "--format=json")
+		assert.NoError(t, driver(&opts, args, io.Discard), args)
+	}
+}
+
+// Short boolean names are case-sensitive: -d is DNSSEC, -S the statistics.
+func TestShortBooleanCase(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	opts := newOpts()
+	_, err := configure(&opts, []string{"-S=true", "-d=false", "example.com"})
+	assert.NoError(t, err)
+	assert.True(t, opts.ShowStats)
+	assert.False(t, opts.DNSSEC)
 }
