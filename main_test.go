@@ -1054,11 +1054,11 @@ func TestDaemonFlag(t *testing.T) {
 		assert.Equal(t, "/run/q.sock", opts.Daemon, args)
 	}
 
-	// Anywhere else -D is an error, as are a missing address, a positional, an
-	// unknown flag, and the flags that cannot serve a lookup.
+	// Anywhere else -D is an error, as are a missing or empty address, a
+	// positional, an unknown flag, and the flags that cannot serve a lookup.
 	for _, args := range [][]string{
 		{"-v", "-D", "127.0.0.1:0"}, {"example.com", "--daemon=127.0.0.1:0"}, {"-b", "127.0.0.1:5353", "-D", "127.0.0.1:0"}, {"A", "--daemon", "127.0.0.1:0"},
-		{"-D"}, {"-D", "-b", "127.0.0.1:5353"}, {"-D", "127.0.0.1:0", "extra"}, {"-D", "127.0.0.1:0", "--no-such-flag"},
+		{"-D"}, {"-D", "-b", "127.0.0.1:5353"}, {"-D="}, {"--daemon="}, {"example.com", "-D="}, {"example.com", "--daemon="}, {"-D", "127.0.0.1:0", "extra"}, {"-D", "127.0.0.1:0", "--no-such-flag"},
 		{"-D", "127.0.0.1:0", "--recaxfr"}, {"-D", "127.0.0.1:0", "--nsid-only"}, {"-D", "127.0.0.1:0", "-N=true"}, {"-D", "127.0.0.1:0", "--subnet=bogus"},
 	} {
 		opts = newOpts()
@@ -1188,12 +1188,20 @@ func TestNSFlagReferral(t *testing.T) {
 		_ = w.WriteMsg(m)
 	})
 	for _, args := range [][]string{{"-t", "NS", "example.com"}, {"NS", "example.com"}} {
-		opts := newOpts()
-		var out bytes.Buffer
-		args = append(args, "--server="+server, "--format=raw")
-		assert.NoError(t, driver(&opts, args, &out), args)
+		out, err := run(append(args, "--server="+server, "--format=raw")...)
+		assert.NoError(t, err, args)
 		assert.Contains(t, out.String(), "ns.example.com.", args)
 	}
+}
+
+// A true or false value of a flag that is not a boolean stays its value.
+func TestNonbooleanFlagValues(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	opts := newOpts()
+	_, err := configure(&opts, []string{"-q", "true", "--http-header=X-Flag: value=true"})
+	assert.NoError(t, err)
+	assert.Equal(t, "true", opts.Name)
+	assert.Equal(t, []string{"X-Flag: value=true"}, opts.HTTPHeaders)
 }
 
 // A server given to -s or --server may carry the @ of the positional form.

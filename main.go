@@ -305,10 +305,13 @@ func configure(opts *cli.Flags, args []string) ([]string, error) {
 	rest, plus := splitPlusFlags(rest)
 	cli.ParsePlusFlags(opts, plus)
 
-	if (opts.Daemon != "") != daemon {
+	if parser.FindOptionByLongName("daemon").IsSet() != daemon {
 		return nil, fmt.Errorf("-D/--daemon must be the first argument")
 	}
 	if daemon {
+		if opts.Daemon == "" {
+			return nil, fmt.Errorf("daemon: empty address")
+		}
 		if len(rest) > 0 {
 			return nil, fmt.Errorf("daemon: unexpected argument %q", rest[0])
 		}
@@ -358,10 +361,7 @@ func configure(opts *cli.Flags, args []string) ([]string, error) {
 // isDaemonFlag reports whether arg is -D in one of go-flags' spellings:
 // -D, -DADDR, --daemon, --daemon=ADDR.
 func isDaemonFlag(arg string) bool {
-	if strings.HasPrefix(arg, "--") {
-		return arg == "--daemon" || strings.HasPrefix(arg, "--daemon=")
-	}
-	return strings.HasPrefix(arg, "-D")
+	return arg == "--daemon" || strings.HasPrefix(arg, "--daemon=") || strings.HasPrefix(arg, "-D")
 }
 
 // splitPlusFlags separates the dig-style +[no]flag tokens, which go-flags
