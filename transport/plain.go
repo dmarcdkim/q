@@ -16,6 +16,8 @@ type Plain struct {
 	EDNS      bool
 	UDPBuffer uint16
 	Timeout   time.Duration
+	// Socket, when set, carries the UDP queries instead of a socket per query.
+	Socket *UDPSocket
 }
 
 func (p *Plain) Exchange(m *dns.Msg) (*dns.Msg, error) {
@@ -85,8 +87,13 @@ func (p *Plain) Exchange(m *dns.Msg) (*dns.Msg, error) {
 		}
 	}
 
-	client := dns.Client{UDPSize: p.UDPBuffer, Timeout: p.Timeout}
-	reply, _, err := client.Exchange(m, p.Server)
+	var reply *dns.Msg
+	if p.Socket != nil {
+		reply, err = p.Socket.Exchange(m, p.Server, p.Timeout)
+	} else {
+		client := dns.Client{UDPSize: p.UDPBuffer, Timeout: p.Timeout}
+		reply, _, err = client.Exchange(m, p.Server)
+	}
 
 	if reply != nil && reply.Truncated {
 		log.Debugf("Truncated reply from %s for %s over UDP, retrying over TCP", p.Server, m.Question[0].String())
@@ -96,7 +103,8 @@ func (p *Plain) Exchange(m *dns.Msg) (*dns.Msg, error) {
 	return reply, err
 }
 
-// Close is a no-op for the plain transport
+// Close is a no-op: the plain transport holds no connection, and a shared
+// Socket belongs to whoever opened it.
 func (p *Plain) Close() error {
 	return nil
 }
