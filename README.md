@@ -224,3 +224,5 @@ curl http://127.0.0.1:8053/health
 ```
 
 `/query` returns what `q @9.9.9.9 TXT MX example.com --timeout=3s --format=json` prints; `type` and `server` repeat or take comma-separated lists. A failed lookup is a `502` whose body is the CLI error message.
+
+Every plain UDP query the daemon sends leaves from one socket, so a NAT between the daemon and the servers holds one entry per server instead of one per query. Replies are matched to their query by server address, message ID and question; a truncated reply is retried over TCP as on the CLI.

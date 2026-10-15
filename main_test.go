@@ -9,8 +9,10 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -712,7 +714,7 @@ func TestMainMultipleServersAllFail(t *testing.T) {
 }
 
 func TestDaemonQuery(t *testing.T) {
-	srv := httptest.NewServer(daemonMux(daemonBase(t)))
+	srv := httptest.NewServer(daemonMux(daemonBase(t), nil))
 	defer srv.Close()
 
 	res, err := http.Get(srv.URL + "/query?name=example.com&type=A&server=9.9.9.9&timeout=5s")
@@ -790,7 +792,7 @@ func daemonBase(t *testing.T) cli.Flags {
 
 func daemonGet(base cli.Flags, query url.Values) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
-	daemonMux(base).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/query?"+query.Encode(), nil))
+	daemonMux(base, nil).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/query?"+query.Encode(), nil))
 	return w
 }
 
@@ -1002,7 +1004,7 @@ func TestDaemonWaitsForShutdown(t *testing.T) {
 }
 
 func TestDaemonConcurrentQueries(t *testing.T) {
-	srv := httptest.NewServer(daemonMux(daemonBase(t)))
+	srv := httptest.NewServer(daemonMux(daemonBase(t), nil))
 	defer srv.Close()
 
 	var wg sync.WaitGroup
@@ -1235,4 +1237,82 @@ func TestShortBooleanCase(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, opts.ShowStats)
 	assert.False(t, opts.DNSSEC)
+}
+
+// The daemon's plain UDP queries leave from the one socket it opened, and a
+// query that times out on it reports the timeout like the CLI does.
+func TestDaemonSharesOneUDPSocket(t *testing.T) {
+	var mu sync.Mutex
+	ports := map[string]int{}
+	upstream := serveDNS(t, func(w dns.ResponseWriter, r *dns.Msg) {
+		_, port, _ := net.SplitHostPort(w.RemoteAddr().String())
+		mu.Lock()
+		ports[port]++
+		mu.Unlock()
+		_ = w.WriteMsg(new(dns.Msg).SetReply(r))
+	})
+	socket, err := transport.NewUDPSocket()
+	assert.NoError(t, err)
+	defer func() { _ = socket.Close() }()
+	srv := httptest.NewServer(daemonMux(daemonBase(t), socket))
+	defer srv.Close()
+
+	for i := 0; i < 8; i++ {
+		res, err := http.Get(srv.URL + "/query?name=example.com&type=A&type=TXT&server=" + upstream + "&timeout=2s")
+		assert.Nil(t, err)
+		body, _ := io.ReadAll(res.Body)
+		assert.Equal(t, http.StatusOK, res.StatusCode, string(body))
+	}
+	_, port, _ := net.SplitHostPort(socket.LocalAddr().String())
+	mu.Lock()
+	assert.Equal(t, map[string]int{port: 16}, ports)
+	mu.Unlock()
+
+	res, err := http.Get(srv.URL + "/query?name=example.com&type=A&server=" + silentUDP(t).LocalAddr().String() + "&timeout=300ms")
+	assert.Nil(t, err)
+	body, _ := io.ReadAll(res.Body)
+	assert.Equal(t, http.StatusBadGateway, res.StatusCode, string(body))
+	assert.Contains(t, string(body), "timeout")
+}
+
+// runDaemon closes its UDP socket once the requests have drained: nothing of a
+// stopped daemon stays behind.
+func TestDaemonShutdownClosesUDPSocket(t *testing.T) {
+	upstream := loopbackDNS(t)
+	port, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.Nil(t, err)
+	addr := port.Addr().String()
+	assert.Nil(t, port.Close())
+	// The first signal.Notify of the process starts a goroutine that stays:
+	// take it before the baseline.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT)
+	signal.Stop(signals)
+	goroutines := runtime.NumGoroutine()
+
+	done := make(chan error, 1)
+	go func() { done <- runDaemon(addr, daemonBase(t)) }()
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	assert.Eventually(t, func() bool {
+		res, err := client.Get("http://" + addr + "/health")
+		if err != nil {
+			return false
+		}
+		return res.Body.Close() == nil
+	}, 5*time.Second, 20*time.Millisecond)
+	res, err := client.Get("http://" + addr + "/query?name=example.com&type=A&server=" + upstream + "&timeout=2s")
+	assert.Nil(t, err)
+	body, _ := io.ReadAll(res.Body)
+	_ = res.Body.Close()
+	assert.Equal(t, http.StatusOK, res.StatusCode, string(body))
+
+	self, err := os.FindProcess(os.Getpid())
+	assert.Nil(t, err)
+	assert.Nil(t, self.Signal(syscall.SIGINT))
+	assert.Nil(t, <-done)
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > goroutines && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	assert.LessOrEqual(t, runtime.NumGoroutine(), goroutines, "the daemon left goroutines behind")
 }
