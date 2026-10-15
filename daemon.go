@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/log"
 
 	"github.com/natesales/q/cli"
+	"github.com/natesales/q/transport"
 	"github.com/natesales/q/util"
 )
 
@@ -36,8 +37,16 @@ func runDaemon(addr string, base cli.Flags) error {
 	if err != nil {
 		return err
 	}
+	// One socket for every plain UDP query the daemon sends, closed after the
+	// last request has drained.
+	udp, err := transport.NewUDPSocket()
+	if err != nil {
+		_ = listener.Close()
+		return err
+	}
+	defer func() { _ = udp.Close() }()
 
-	server := &http.Server{Handler: daemonMux(base), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Handler: daemonMux(base, udp), ReadHeaderTimeout: 5 * time.Second}
 	drained := make(chan error, 1)
 	go func() {
 		quit := make(chan os.Signal, 1)
@@ -48,7 +57,7 @@ func runDaemon(addr string, base cli.Flags) error {
 		drained <- server.Shutdown(ctx)
 	}()
 
-	log.Infof("q daemon listening on %s", listener.Addr())
+	log.Infof("q daemon listening on %s, UDP queries leave from %s", listener.Addr(), udp.LocalAddr())
 	if err := server.Serve(listener); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -76,7 +85,7 @@ func removeStaleSocket(path string) error {
 	return os.Remove(path)
 }
 
-func daemonMux(base cli.Flags) *http.ServeMux {
+func daemonMux(base cli.Flags, udp *transport.UDPSocket) *http.ServeMux {
 	// Requests always print JSON, so the color global is never written again
 	// once the server is up.
 	util.UseColor = false
@@ -85,7 +94,7 @@ func daemonMux(base cli.Flags) *http.ServeMux {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
-	mux.HandleFunc("GET /query", func(w http.ResponseWriter, r *http.Request) { queryHandler(base, w, r) })
+	mux.HandleFunc("GET /query", func(w http.ResponseWriter, r *http.Request) { queryHandler(base, udp, w, r) })
 	return mux
 }
 
@@ -93,7 +102,7 @@ func daemonMux(base cli.Flags) *http.ServeMux {
 // with the same JSON the CLI prints for `q @1.1.1.1 TXT MX example.com --timeout=3s --format=json`.
 // type and server may be repeated or comma-separated. A failed lookup is a 502
 // whose body is the CLI's error message.
-func queryHandler(base cli.Flags, w http.ResponseWriter, r *http.Request) {
+func queryHandler(base cli.Flags, udp *transport.UDPSocket, w http.ResponseWriter, r *http.Request) {
 	opts, err := queryOpts(base, r.URL.Query())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -101,7 +110,7 @@ func queryHandler(base cli.Flags, w http.ResponseWriter, r *http.Request) {
 	}
 
 	var buf bytes.Buffer
-	if err := query(&opts, nil, &buf); err != nil {
+	if err := query(&opts, nil, &buf, udp); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}

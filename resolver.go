@@ -118,8 +118,9 @@ func createQuery(opts cli.Flags, rrTypes []uint16) []dns.Msg {
 	return queries
 }
 
-// newTransport creates a new transport based on local options
-func newTransport(opts *cli.Flags, server string, transportType transport.Type, tlsConfig *tls.Config) (*transport.Transport, error) {
+// newTransport creates a new transport based on local options. udp, when set,
+// carries the plain UDP queries instead of a socket per query.
+func newTransport(opts *cli.Flags, server string, transportType transport.Type, tlsConfig *tls.Config, udp *transport.UDPSocket) (*transport.Transport, error) {
 	var ts transport.Transport
 
 	common := transport.Common{
@@ -221,6 +222,7 @@ func newTransport(opts *cli.Flags, server string, transportType transport.Type, 
 			EDNS:      opts.EDNS,
 			UDPBuffer: opts.UDPBuffer,
 			Timeout:   opts.Timeout,
+			Socket:    udp,
 		}
 	default:
 		return nil, fmt.Errorf("unknown transport protocol %s", transportType)

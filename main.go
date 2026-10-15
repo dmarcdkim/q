@@ -277,7 +277,7 @@ func driver(opts *cli.Flags, args []string, out io.Writer) error {
 	if opts.Daemon != "" {
 		return runDaemon(opts.Daemon, *opts)
 	}
-	return query(opts, rest, out)
+	return query(opts, rest, out, nil)
 }
 
 // configure reads the flags once and applies the ones that shape the process:
@@ -377,8 +377,9 @@ func splitPlusFlags(args []string) (rest, plus []string) {
 	return rest, plus
 }
 
-// query runs one lookup with opts, already configured, and writes the result to out.
-func query(opts *cli.Flags, args []string, out io.Writer) error {
+// query runs one lookup with opts, already configured, and writes the result to
+// out. udp, when set, is the socket its plain UDP queries leave from.
+func query(opts *cli.Flags, args []string, out io.Writer, udp *transport.UDPSocket) error {
 	// Parse requested RR types
 	rrTypes, err := cli.ParseRRTypes(opts.Types)
 	if err != nil {
@@ -615,7 +616,7 @@ func query(opts *cli.Flags, args []string, out io.Writer) error {
 			}
 
 			// Create transport
-			txp, err := newTransport(opts, server, transportType, tlsConfig)
+			txp, err := newTransport(opts, server, transportType, tlsConfig, udp)
 			if err != nil {
 				if multiServer {
 					log.Warnf("Skipping server %s (transport error): %v", server, err)
